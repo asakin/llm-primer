@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# primerd — llm-primer daemon
+# Manages a pool of pre-warmed Claude Code sessions in tmux
+
+set -euo pipefail
+
+PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
+PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
+PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"
+PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"
+PRIMER_WATCH_INTERVAL="${PRIMER_WATCH_INTERVAL:-5}"
+PRIMER_PID_FILE="$PRIMER_DIR/primerd.pid"
+PRIMER_LOG_FILE="$PRIMER_DIR/primerd.log"
+PRIMER_STATE_DIR="$PRIMER_DIR/state"
+
+# Directory to watch for changes (triggers /clear + rewarm)
+PRIMER_WATCH_DIR="${PRIMER_WATCH_DIR:-}"
+
+# The tmux session that holds the pool
+TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$PRIMER_LOG_FILE"
+}
+
+die() {
+  log "ERROR: $*" >&2
+  exit 1
+}
+
+require() {
+  command -v "$1" &>/dev/null || die "'$1' is required but not installed"
+}
+
+# ── tmux helpers ──────────────────────────────────────────────────────────────
+
+window_name() {
+  echo "${PRIMER_SESSION_PREFIX}-$1"
+}
+
+pane_content() {
+  local window="$1"
+  tmux capture-pane -t "${TMUX_SESSION}:${window}" -p 2>/dev/null || echo ""
+}
+
+is_warm() {
+  local window="$1"
+  pane_content "$window" | grep -q "SESSION START"
+}
+
+send_keys() {
+  local window="$1"
+  shift
+  tmux send-keys -t "${TMUX_SESSION}:${window}" "$*" Enter
+}
+
+# ── pool management ───────────────────────────────────────────────────────────
+
+ensure_tmux_session() {
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$TMUX_SESSION" -n "${PRIMER_SESSION_PREFIX}-0"
+    log "Created tmux session: $TMUX_SESSION"
+  fi
+}
+
+spawn_window() {
+  local slot="$1"
+  local window
+  window=$(window_name "$slot")
+
+  if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -q "^${window}$"; then
+    tmux new-window -t "$TMUX_SESSION" -n "$window"
+    log "Spawned window: $window"
+  fi
+
+  set_state "$slot" "spawned"
+}
+
+warm_window() {
+  local slot="$1"
+  local window
+  window=$(window_name "$slot")
+
+  log "Warming slot $slot..."
+  set_state "$slot" "warming"
+
+  # Launch claude in the window if not already running
+  local content
+  content=$(pane_content "$window")
+  if ! echo "$content" | grep -q "SESSION START" && ! echo "$content" | grep -q "\$"; then
+    send_keys "$window" "claude"
+  fi
+
+  # Send the warmup message after a brief pause
+  sleep 2
+  send_keys "$window" "$PRIMER_WARMUP_MSG"
+
+  # Wait for SESSION START marker
+  local waited=0
+  while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
+    if is_warm "$window"; then
+      log "Slot $slot is warm ✓"
+      set_state "$slot" "warm"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  log "WARNING: slot $slot did not warm within ${PRIMER_WARMUP_TIMEOUT}s"
+  set_state "$slot" "stale"
+}
+
+rewarm_window() {
+  local slot="$1"
+  local window
+  window=$(window_name "$slot")
+
+  log "Re-warming slot $slot (config changed)..."
+  set_state "$slot" "rewarming"
+
+  send_keys "$window" "/clear"
+  sleep 1
+  send_keys "$window" "$PRIMER_WARMUP_MSG"
+
+  local waited=0
+  while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
+    if is_warm "$window"; then
+      log "Slot $slot re-warmed ✓"
+      set_state "$slot" "warm"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  log "WARNING: slot $slot did not re-warm within ${PRIMER_WARMUP_TIMEOUT}s"
+  set_state "$slot" "stale"
+}
+
+# ── state tracking ─────────────────────────────────────────────────────────────
+
+set_state() {
+  local slot="$1"
+  local state="$2"
+  mkdir -p "$PRIMER_STATE_DIR"
+  echo "$state" > "$PRIMER_STATE_DIR/slot-${slot}"
+}
+
+get_state() {
+  local slot="$1"
+  local file="$PRIMER_STATE_DIR/slot-${slot}"
+  [[ -f "$file" ]] && cat "$file" || echo "unknown"
+}
+
+# ── file watcher ───────────────────────────────────────────────────────────────
+
+# Returns a hash of the watch directory content (mtime-based, no heavy deps)
+dir_hash() {
+  local dir="$1"
+  find "$dir" -type f -newer "$PRIMER_DIR/.last-hash-anchor" -print 2>/dev/null | sort | md5 2>/dev/null || find "$dir" -type f -print0 | xargs -0 stat -f "%m" 2>/dev/null | md5 || echo "0"
+}
+
+watch_and_rewarm() {
+  [[ -z "$PRIMER_WATCH_DIR" ]] && return
+  [[ -d "$PRIMER_WATCH_DIR" ]] || return
+
+  local last_hash=""
+  touch "$PRIMER_DIR/.last-hash-anchor"
+
+  while true; do
+    local current_hash
+    current_hash=$(find "$PRIMER_WATCH_DIR" -type f \( -name "*.md" -o -name "*.json" \) -print0 | sort -z | xargs -0 stat -f "%m %N" 2>/dev/null | md5 || echo "0")
+
+    if [[ -n "$last_hash" && "$current_hash" != "$last_hash" ]]; then
+      log "Config change detected in $PRIMER_WATCH_DIR — rewarming pool"
+      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+        rewarm_window "$slot" &
+      done
+    fi
+
+    last_hash="$current_hash"
+    sleep "$PRIMER_WATCH_INTERVAL"
+  done
+}
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+
+start_daemon() {
+  require tmux
+  require claude
+
+  mkdir -p "$PRIMER_DIR" "$PRIMER_STATE_DIR"
+  log "Starting primerd (pool size: $PRIMER_POOL_SIZE)"
+
+  ensure_tmux_session
+
+  # Initial pool spawn + warm
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    spawn_window "$slot"
+    warm_window "$slot" &
+  done
+  wait
+
+  # Start file watcher in background (if watch dir set)
+  watch_and_rewarm &
+
+  # Main health loop — re-warm stale slots
+  while true; do
+    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+      local state
+      state=$(get_state "$slot")
+      if [[ "$state" == "stale" ]] || ! is_warm "$(window_name "$slot")"; then
+        if [[ "$state" != "rewarming" && "$state" != "warming" ]]; then
+          rewarm_window "$slot" &
+        fi
+      fi
+    done
+    sleep 10
+  done
+}
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  start)
+    if [[ -f "$PRIMER_PID_FILE" ]] && kill -0 "$(cat "$PRIMER_PID_FILE")" 2>/dev/null; then
+      echo "primerd is already running (pid $(cat "$PRIMER_PID_FILE"))"
+      exit 0
+    fi
+    mkdir -p "$PRIMER_DIR"
+    start_daemon &
+    echo $! > "$PRIMER_PID_FILE"
+    echo "primerd started (pid $(cat "$PRIMER_PID_FILE"))"
+    ;;
+  stop)
+    if [[ -f "$PRIMER_PID_FILE" ]]; then
+      local pid
+      pid=$(cat "$PRIMER_PID_FILE")
+      kill "$pid" 2>/dev/null && echo "primerd stopped" || echo "primerd was not running"
+      rm -f "$PRIMER_PID_FILE"
+    else
+      echo "primerd is not running"
+    fi
+    ;;
+  status)
+    if [[ -f "$PRIMER_PID_FILE" ]] && kill -0 "$(cat "$PRIMER_PID_FILE")" 2>/dev/null; then
+      echo "primerd: running (pid $(cat "$PRIMER_PID_FILE"))"
+    else
+      echo "primerd: not running"
+    fi
+    mkdir -p "$PRIMER_STATE_DIR"
+    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+      local state
+      state=$(get_state "$slot")
+      printf "  slot %s: %s\n" "$slot" "$state"
+    done
+    ;;
+  help|--help|-h)
+    cat <<'HELP'
+primerd — llm-primer daemon
+
+Usage: primerd <command>
+
+Commands:
+  start    Start the daemon (backgrounds itself)
+  stop     Stop the daemon
+  status   Show daemon and pool status
+
+Configuration (environment variables):
+  PRIMER_DIR              State directory (default: ~/.llm-primer)
+  PRIMER_SESSION_PREFIX   Tmux window prefix (default: primer)
+  PRIMER_POOL_SIZE        Number of warm sessions to maintain (default: 2)
+  PRIMER_WARMUP_MSG       Message to send to trigger warmup (default: ready)
+  PRIMER_WARMUP_TIMEOUT   Seconds to wait for SESSION START (default: 60)
+  PRIMER_WATCH_DIR        Directory to watch for changes (triggers rewarm)
+  PRIMER_WATCH_INTERVAL   Seconds between watch checks (default: 5)
+
+HELP
+    ;;
+  *)
+    echo "Unknown command: $cmd. Run 'primerd help' for usage."
+    exit 1
+    ;;
+esac

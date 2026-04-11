@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# primer — llm-primer CLI
+# Attach to and manage pre-warmed Claude Code sessions
+
+set -euo pipefail
+
+PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
+PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
+PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+require() {
+  command -v "$1" &>/dev/null || die "'$1' is required but not installed"
+}
+
+window_name() {
+  echo "${PRIMER_SESSION_PREFIX}-$1"
+}
+
+get_state() {
+  local slot="$1"
+  local file="$PRIMER_DIR/state/slot-${slot}"
+  [[ -f "$file" ]] && cat "$file" || echo "unknown"
+}
+
+pane_content() {
+  local window="$1"
+  tmux capture-pane -t "${TMUX_SESSION}:${window}" -p 2>/dev/null || echo ""
+}
+
+is_warm() {
+  local window="$1"
+  pane_content "$window" | grep -q "SESSION START"
+}
+
+find_warm_slot() {
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    local window
+    window=$(window_name "$slot")
+    if is_warm "$window"; then
+      echo "$slot"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  attach|a)
+    require tmux
+
+    slot="${2:-}"
+
+    if [[ -z "$slot" ]]; then
+      if ! slot=$(find_warm_slot); then
+        echo "⚠ No warm slots available. Attaching to slot 0 (may not be fully ready)."
+        slot=0
+      fi
+    fi
+
+    window=$(window_name "$slot")
+    state=$(get_state "$slot")
+
+    echo "→ Attaching to slot $slot (state: $state)"
+
+    if [[ -n "${TMUX:-}" ]]; then
+      # Already inside tmux — switch window
+      tmux select-window -t "${TMUX_SESSION}:${window}" 2>/dev/null || \
+        die "Slot $slot not found. Is primerd running?"
+    else
+      # Outside tmux — attach to session, select window
+      tmux attach-session -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:${window}" 2>/dev/null || \
+        die "Pool session not found. Run 'primerd start' first."
+    fi
+    ;;
+
+  status|s)
+    require tmux
+
+    # Daemon status
+    if [[ -f "$PRIMER_DIR/primerd.pid" ]] && kill -0 "$(cat "$PRIMER_DIR/primerd.pid")" 2>/dev/null; then
+      echo "daemon: running (pid $(cat "$PRIMER_DIR/primerd.pid"))"
+    else
+      echo "daemon: not running (start with 'primerd start')"
+    fi
+
+    # Pool status
+    echo ""
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      echo "pool: no tmux session found"
+    else
+      echo "pool: $TMUX_SESSION"
+      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+        window=$(window_name "$slot")
+        state=$(get_state "$slot")
+        warm=""
+        if is_warm "$window" 2>/dev/null; then
+          warm=" ✓ warm"
+        fi
+        printf "  slot %s (%s): %s%s\n" "$slot" "$window" "$state" "$warm"
+      done
+    fi
+    ;;
+
+  start)
+    primerd start
+    ;;
+
+  stop)
+    primerd stop
+    ;;
+
+  logs|log)
+    local log_file="$PRIMER_DIR/primerd.log"
+    if [[ -f "$log_file" ]]; then
+      tail -f "$log_file"
+    else
+      echo "No log file found at $log_file"
+    fi
+    ;;
+
+  help|--help|-h|"")
+    cat <<'HELP'
+primer — llm-primer
+
+Attach to a pre-warmed Claude Code session instantly.
+
+Usage:
+  primer attach [slot]   Attach to a warm session (default: picks the first warm slot)
+  primer status          Show pool and daemon status
+  primer start           Start the primerd daemon
+  primer stop            Stop the primerd daemon
+  primer logs            Tail the daemon log
+
+Shorthand:
+  primer a               Same as primer attach
+
+Environment:
+  PRIMER_POOL_SIZE       Number of sessions in the pool (default: 2)
+  PRIMER_DIR             State directory (default: ~/.llm-primer)
+  PRIMER_WATCH_DIR       Directory to watch for config changes
+
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $cmd. Run 'primer help' for usage."
+    exit 1
+    ;;
+esac
