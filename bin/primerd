@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 # primerd — llm-primer daemon
-# Manages a pool of pre-warmed Claude Code sessions in tmux
+# Manages pre-warmed Claude Code sessions in tmux.
+#
+# Two modes:
+#   lazy (default) — pool starts empty. Sessions warm on demand when Claude
+#                    signals via ~/.llm-primer/warm-request (PostCompact hook,
+#                    CLAUDE.md instruction, or `primer warm`). Zero idle cost.
+#   eager           — always keeps PRIMER_POOL_SIZE sessions warm. Set
+#                    PRIMER_MODE=eager to opt in.
 
 set -euo pipefail
 
 PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
 PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
 PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+PRIMER_MODE="${PRIMER_MODE:-lazy}"        # lazy | eager
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"
+PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"
 PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"
 PRIMER_WATCH_INTERVAL="${PRIMER_WATCH_INTERVAL:-5}"
 PRIMER_PID_FILE="$PRIMER_DIR/primerd.pid"
 PRIMER_LOG_FILE="$PRIMER_DIR/primerd.log"
 PRIMER_STATE_DIR="$PRIMER_DIR/state"
+PRIMER_WARM_REQUEST="$PRIMER_DIR/warm-request"  # touch this to trigger lazy warm
 
-# Directory to watch for changes (triggers /clear + rewarm)
+# Directory to watch for config changes (triggers /clear + rewarm)
 PRIMER_WATCH_DIR="${PRIMER_WATCH_DIR:-}"
 
 # The tmux session that holds the pool
@@ -46,7 +56,7 @@ pane_content() {
 
 is_warm() {
   local window="$1"
-  pane_content "$window" | grep -q "SESSION START"
+  pane_content "$window" | grep -qF "$PRIMER_WARMUP_MARKER"
 }
 
 send_keys() {
@@ -62,6 +72,28 @@ ensure_tmux_session() {
     tmux new-session -d -s "$TMUX_SESSION" -n "${PRIMER_SESSION_PREFIX}-0"
     log "Created tmux session: $TMUX_SESSION"
   fi
+}
+
+# Returns the index of the next unused slot (creating it if needed), or 1 if pool is full
+next_slot() {
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    local state
+    state=$(get_state "$slot")
+    if [[ "$state" == "unknown" || "$state" == "cold" ]]; then
+      echo "$slot"
+      return 0
+    fi
+  done
+  # All slots occupied — find the oldest stale one
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    local state
+    state=$(get_state "$slot")
+    if [[ "$state" == "stale" ]]; then
+      echo "$slot"
+      return 0
+    fi
+  done
+  return 1
 }
 
 spawn_window() {
@@ -85,18 +117,15 @@ warm_window() {
   log "Warming slot $slot..."
   set_state "$slot" "warming"
 
-  # Launch claude in the window if not already running
   local content
   content=$(pane_content "$window")
-  if ! echo "$content" | grep -q "SESSION START" && ! echo "$content" | grep -q "\$"; then
+  if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER" && ! echo "$content" | grep -q '\$'; then
     send_keys "$window" "claude"
   fi
 
-  # Send the warmup message after a brief pause
   sleep 2
   send_keys "$window" "$PRIMER_WARMUP_MSG"
 
-  # Wait for SESSION START marker
   local waited=0
   while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
     if is_warm "$window"; then
@@ -117,7 +146,7 @@ rewarm_window() {
   local window
   window=$(window_name "$slot")
 
-  log "Re-warming slot $slot (config changed)..."
+  log "Re-warming slot $slot..."
   set_state "$slot" "rewarming"
 
   send_keys "$window" "/clear"
@@ -154,29 +183,63 @@ get_state() {
   [[ -f "$file" ]] && cat "$file" || echo "unknown"
 }
 
-# ── file watcher ───────────────────────────────────────────────────────────────
+# ── lazy warm trigger ─────────────────────────────────────────────────────────
+#
+# Any process can request a warm session by touching ~/.llm-primer/warm-request.
+# Intended callers:
+#   - Claude Code PostCompact hook (context just got heavy → warm a replacement)
+#   - CLAUDE.md instruction (Claude decides its context is long → signals itself)
+#   - `primer warm` CLI command
+#   - Any script
+#
+# primerd consumes the file (rm after read) and warms one slot.
 
-# Returns a hash of the watch directory content (mtime-based, no heavy deps)
-dir_hash() {
-  local dir="$1"
-  find "$dir" -type f -newer "$PRIMER_DIR/.last-hash-anchor" -print 2>/dev/null | sort | md5 2>/dev/null || find "$dir" -type f -print0 | xargs -0 stat -f "%m" 2>/dev/null | md5 || echo "0"
+watch_warm_request() {
+  while true; do
+    if [[ -f "$PRIMER_WARM_REQUEST" ]]; then
+      rm -f "$PRIMER_WARM_REQUEST"
+      log "Warm request received"
+
+      local slot
+      if slot=$(next_slot 2>/dev/null); then
+        ensure_tmux_session
+        spawn_window "$slot"
+        warm_window "$slot" &
+      else
+        log "All slots already warm or warming — ignoring warm request"
+      fi
+    fi
+    sleep 2
+  done
 }
+
+# ── config file watcher ───────────────────────────────────────────────────────
 
 watch_and_rewarm() {
   [[ -z "$PRIMER_WATCH_DIR" ]] && return
   [[ -d "$PRIMER_WATCH_DIR" ]] || return
 
   local last_hash=""
-  touch "$PRIMER_DIR/.last-hash-anchor"
 
   while true; do
     local current_hash
-    current_hash=$(find "$PRIMER_WATCH_DIR" -type f \( -name "*.md" -o -name "*.json" \) -print0 | sort -z | xargs -0 stat -f "%m %N" 2>/dev/null | md5 || echo "0")
+    current_hash=$(find "$PRIMER_WATCH_DIR" -type f \( -name "*.md" -o -name "*.json" \) -print0 \
+      | sort -z | xargs -0 stat -f "%m %N" 2>/dev/null \
+      || find "$PRIMER_WATCH_DIR" -type f \( -name "*.md" -o -name "*.json" \) -print0 \
+      | sort -z | xargs -0 stat -c "%Y %n" 2>/dev/null \
+      || echo "0")
+    current_hash=$(echo "$current_hash" | md5sum 2>/dev/null | cut -d' ' -f1 \
+      || echo "$current_hash" | md5 2>/dev/null \
+      || echo "0")
 
     if [[ -n "$last_hash" && "$current_hash" != "$last_hash" ]]; then
-      log "Config change detected in $PRIMER_WATCH_DIR — rewarming pool"
+      log "Config change detected in $PRIMER_WATCH_DIR — rewarming all warm slots"
       for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-        rewarm_window "$slot" &
+        local state
+        state=$(get_state "$slot")
+        if [[ "$state" == "warm" ]]; then
+          rewarm_window "$slot" &
+        fi
       done
     fi
 
@@ -192,31 +255,45 @@ start_daemon() {
   require claude
 
   mkdir -p "$PRIMER_DIR" "$PRIMER_STATE_DIR"
-  log "Starting primerd (pool size: $PRIMER_POOL_SIZE)"
+  log "Starting primerd (mode: $PRIMER_MODE, pool size: $PRIMER_POOL_SIZE)"
 
   ensure_tmux_session
 
-  # Initial pool spawn + warm
-  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-    spawn_window "$slot"
-    warm_window "$slot" &
-  done
-  wait
+  if [[ "$PRIMER_MODE" == "eager" ]]; then
+    # Eager: pre-warm the full pool immediately
+    log "Eager mode: pre-warming $PRIMER_POOL_SIZE slots"
+    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+      spawn_window "$slot"
+      warm_window "$slot" &
+    done
+    wait
+  else
+    # Lazy: pool starts cold, warms on demand
+    log "Lazy mode: pool is cold — warming on demand via $PRIMER_WARM_REQUEST"
+    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+      set_state "$slot" "cold"
+    done
+  fi
 
-  # Start file watcher in background (if watch dir set)
+  # Warm request watcher (lazy mode signal handler — runs in both modes)
+  watch_warm_request &
+
+  # Config file watcher
   watch_and_rewarm &
 
-  # Main health loop — re-warm stale slots
+  # Health loop (eager mode: re-warm stale slots; lazy mode: no-op unless slots were warmed)
   while true; do
-    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-      local state
-      state=$(get_state "$slot")
-      if [[ "$state" == "stale" ]] || ! is_warm "$(window_name "$slot")"; then
-        if [[ "$state" != "rewarming" && "$state" != "warming" ]]; then
-          rewarm_window "$slot" &
+    if [[ "$PRIMER_MODE" == "eager" ]]; then
+      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+        local state
+        state=$(get_state "$slot")
+        if [[ "$state" == "stale" ]] || { [[ "$state" == "warm" ]] && ! is_warm "$(window_name "$slot")"; }; then
+          if [[ "$state" != "rewarming" && "$state" != "warming" ]]; then
+            rewarm_window "$slot" &
+          fi
         fi
-      fi
-    done
+      done
+    fi
     sleep 10
   done
 }
@@ -234,13 +311,11 @@ case "$cmd" in
     mkdir -p "$PRIMER_DIR"
     start_daemon &
     echo $! > "$PRIMER_PID_FILE"
-    echo "primerd started (pid $(cat "$PRIMER_PID_FILE"))"
+    echo "primerd started in $PRIMER_MODE mode (pid $(cat "$PRIMER_PID_FILE"))"
     ;;
   stop)
     if [[ -f "$PRIMER_PID_FILE" ]]; then
-      local pid
-      pid=$(cat "$PRIMER_PID_FILE")
-      kill "$pid" 2>/dev/null && echo "primerd stopped" || echo "primerd was not running"
+      kill "$(cat "$PRIMER_PID_FILE")" 2>/dev/null && echo "primerd stopped" || echo "primerd was not running"
       rm -f "$PRIMER_PID_FILE"
     else
       echo "primerd is not running"
@@ -248,15 +323,18 @@ case "$cmd" in
     ;;
   status)
     if [[ -f "$PRIMER_PID_FILE" ]] && kill -0 "$(cat "$PRIMER_PID_FILE")" 2>/dev/null; then
-      echo "primerd: running (pid $(cat "$PRIMER_PID_FILE"))"
+      echo "primerd: running (mode: $PRIMER_MODE, pid $(cat "$PRIMER_PID_FILE"))"
     else
       echo "primerd: not running"
     fi
     mkdir -p "$PRIMER_STATE_DIR"
+    echo ""
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
       local state
       state=$(get_state "$slot")
-      printf "  slot %s: %s\n" "$slot" "$state"
+      local warm_indicator=""
+      [[ "$state" == "warm" ]] && warm_indicator=" ✓"
+      printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_indicator"
     done
     ;;
   help|--help|-h)
@@ -266,18 +344,38 @@ primerd — llm-primer daemon
 Usage: primerd <command>
 
 Commands:
-  start    Start the daemon (backgrounds itself)
+  start    Start the daemon
   stop     Stop the daemon
   status   Show daemon and pool status
+
+Modes:
+  lazy (default)   Pool starts cold. Sessions warm on demand when Claude
+                   signals via ~/.llm-primer/warm-request. Zero idle token cost.
+                   Triggered by: PostCompact hook, CLAUDE.md instruction, `primer warm`.
+
+  eager            Always keeps PRIMER_POOL_SIZE sessions warm. Set PRIMER_MODE=eager.
 
 Configuration (environment variables):
   PRIMER_DIR              State directory (default: ~/.llm-primer)
   PRIMER_SESSION_PREFIX   Tmux window prefix (default: primer)
-  PRIMER_POOL_SIZE        Number of warm sessions to maintain (default: 2)
-  PRIMER_WARMUP_MSG       Message to send to trigger warmup (default: ready)
-  PRIMER_WARMUP_TIMEOUT   Seconds to wait for SESSION START (default: 60)
-  PRIMER_WATCH_DIR        Directory to watch for changes (triggers rewarm)
+  PRIMER_POOL_SIZE        Max sessions in pool (default: 2)
+  PRIMER_MODE             lazy | eager (default: lazy)
+  PRIMER_WARMUP_MSG       Message sent to trigger session protocol (default: ready)
+  PRIMER_WARMUP_MARKER    String to watch for in output (default: SESSION START)
+  PRIMER_WARMUP_TIMEOUT   Seconds to wait for warmup marker (default: 60)
+  PRIMER_WATCH_DIR        Config dir to watch for changes (triggers rewarm)
   PRIMER_WATCH_INTERVAL   Seconds between watch checks (default: 5)
+
+Lazy mode setup (recommended):
+  Add to Claude Code settings.json:
+
+    "hooks": {
+      "PostCompact": [{"hooks": [{"type": "command",
+        "command": "touch ~/.llm-primer/warm-request"}]}]
+    }
+
+  Or add to CLAUDE.md:
+    When your context is getting long, run: touch ~/.llm-primer/warm-request
 
 HELP
     ;;

@@ -117,6 +117,11 @@ case "$cmd" in
     primerd stop
     ;;
 
+  warm|w)
+    touch "$PRIMER_DIR/warm-request"
+    echo "→ Warm request sent. primerd will start warming a slot."
+    ;;
+
   logs|log)
     local log_file="$PRIMER_DIR/primerd.log"
     if [[ -f "$log_file" ]]; then
@@ -134,6 +139,7 @@ Attach to a pre-warmed Claude Code session instantly.
 
 Usage:
   primer attach [slot]   Attach to a warm session (default: picks the first warm slot)
+  primer warm            Signal primerd to warm a session now
   primer status          Show pool and daemon status
   primer start           Start the primerd daemon
   primer stop            Stop the primerd daemon
@@ -141,6 +147,7 @@ Usage:
 
 Shorthand:
   primer a               Same as primer attach
+  primer w               Same as primer warm
 
 Environment:
   PRIMER_POOL_SIZE       Number of sessions in the pool (default: 2)
