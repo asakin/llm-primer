@@ -15,6 +15,7 @@ PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
 PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
 PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
 PRIMER_MODE="${PRIMER_MODE:-lazy}"        # lazy | eager
+PRIMER_CLI="${PRIMER_CLI:-claude}"        # command to launch the LLM session
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"
 PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"
@@ -120,7 +121,7 @@ warm_window() {
   local content
   content=$(pane_content "$window")
   if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER" && ! echo "$content" | grep -q '\$'; then
-    send_keys "$window" "claude"
+    send_keys "$window" "$PRIMER_CLI"
   fi
 
   sleep 2
@@ -252,7 +253,7 @@ watch_and_rewarm() {
 
 start_daemon() {
   require tmux
-  require claude
+  require "$PRIMER_CLI"
 
   mkdir -p "$PRIMER_DIR" "$PRIMER_STATE_DIR"
   log "Starting primerd (mode: $PRIMER_MODE, pool size: $PRIMER_POOL_SIZE)"

@@ -1,8 +1,8 @@
 # llm-primer
 
-No more waiting for Claude Code to boot.
+No more waiting for your LLM CLI to boot.
 
-llm-primer keeps pre-warmed Claude Code sessions ready in tmux. When you need one, you get it instantly — fully initialized, session protocol already run, ready to type.
+llm-primer keeps pre-warmed sessions ready in tmux — Claude Code, Aider, a local Ollama model, anything with a startup protocol. When you need a session, you get one instantly — fully initialized, context already loaded, ready to type.
 
 ## How it works
 
@@ -72,7 +72,7 @@ Or:
 curl -fsSL https://raw.githubusercontent.com/asakin/llm-primer/main/install.sh | bash
 ```
 
-**Requires:** `tmux`, `claude` (Claude Code CLI)
+**Requires:** `tmux` and whatever CLI you're using (`claude`, `aider`, `ollama`, etc.)
 
 ## Usage
 
@@ -98,6 +98,7 @@ alias cc='primer attach'    # two keystrokes to a warm session
 
 | Variable | Default | Description |
 |---|---|---|
+| `PRIMER_CLI` | `claude` | CLI command to launch (e.g. `aider`, `ollama run llama3`, `llm`) |
 | `PRIMER_MODE` | `lazy` | `lazy` or `eager` |
 | `PRIMER_POOL_SIZE` | `2` | Max sessions in the pool |
 | `PRIMER_DIR` | `~/.llm-primer` | State + log directory |
@@ -108,9 +109,25 @@ alias cc='primer attach'    # two keystrokes to a warm session
 | `PRIMER_WATCH_DIR` | *(none)* | Config dir to watch for changes (triggers rewarm) |
 | `PRIMER_WATCH_INTERVAL` | `5` | Seconds between config watch checks |
 
-## Works with any LLM wiki setup
+## Works with any LLM CLI
 
-llm-primer doesn't care what your startup protocol does. It watches for `PRIMER_WARMUP_MARKER` in the pane output — configure it to match whatever your system prints when initialization completes. Compatible with llm-context-base, claude-obsidian, wiki-compiler, wiki-skills, or any custom setup.
+llm-primer doesn't care what's running in the tmux window. It sends keystrokes and watches for a string. Change `PRIMER_CLI` to use a different tool:
+
+```bash
+# Local Ollama model
+export PRIMER_CLI="ollama run llama3"
+export PRIMER_WARMUP_MARKER="ready"   # whatever your setup prints on init
+
+# Aider with a local model
+export PRIMER_CLI="aider --model ollama/llama3"
+export PRIMER_WARMUP_MARKER="Aider v"
+
+# Simon Willison's llm CLI
+export PRIMER_CLI="llm chat"
+export PRIMER_WARMUP_MARKER="Chatting with"
+```
+
+The PostCompact hook is Claude Code-specific, but the warm-request signal works the same way regardless of what CLI you're running. Any process can touch `~/.llm-primer/warm-request` to request a warm slot.
 
 ## The pool lifecycle
 
