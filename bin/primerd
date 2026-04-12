@@ -16,6 +16,7 @@ PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
 PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
 PRIMER_MODE="${PRIMER_MODE:-lazy}"        # lazy | eager
 PRIMER_CLI="${PRIMER_CLI:-claude}"        # command to launch the LLM session
+PRIMER_RESET_CMD="${PRIMER_RESET_CMD:-/clear}"  # command to reset session context; set to "" to kill+respawn instead
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"
 PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"
@@ -150,8 +151,22 @@ rewarm_window() {
   log "Re-warming slot $slot..."
   set_state "$slot" "rewarming"
 
-  send_keys "$window" "/clear"
-  sleep 1
+  if [[ -n "$PRIMER_RESET_CMD" ]]; then
+    # Soft reset — send the reset command (e.g. /clear for Claude Code)
+    send_keys "$window" "$PRIMER_RESET_CMD"
+    sleep 1
+  else
+    # Hard reset — kill current process and respawn the CLI
+    # Used when the CLI has no soft-reset command
+    log "Slot $slot: no PRIMER_RESET_CMD set, using kill+respawn"
+    tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
+    sleep 1
+    tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
+    sleep 1
+    send_keys "$window" "$PRIMER_CLI"
+    sleep 2
+  fi
+
   send_keys "$window" "$PRIMER_WARMUP_MSG"
 
   local waited=0
@@ -286,7 +301,6 @@ start_daemon() {
   while true; do
     if [[ "$PRIMER_MODE" == "eager" ]]; then
       for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-        local state
         state=$(get_state "$slot")
         if [[ "$state" == "stale" ]] || { [[ "$state" == "warm" ]] && ! is_warm "$(window_name "$slot")"; }; then
           if [[ "$state" != "rewarming" && "$state" != "warming" ]]; then
@@ -331,9 +345,8 @@ case "$cmd" in
     mkdir -p "$PRIMER_STATE_DIR"
     echo ""
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-      local state
       state=$(get_state "$slot")
-      local warm_indicator=""
+      warm_indicator=""
       [[ "$state" == "warm" ]] && warm_indicator=" ✓"
       printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_indicator"
     done
@@ -361,6 +374,8 @@ Configuration (environment variables):
   PRIMER_SESSION_PREFIX   Tmux window prefix (default: primer)
   PRIMER_POOL_SIZE        Max sessions in pool (default: 2)
   PRIMER_MODE             lazy | eager (default: lazy)
+  PRIMER_RESET_CMD        Command to reset session context (default: /clear for Claude Code)
+                          Set to "" to kill the process and respawn PRIMER_CLI instead
   PRIMER_WARMUP_MSG       Message sent to trigger session protocol (default: ready)
   PRIMER_WARMUP_MARKER    String to watch for in output (default: SESSION START)
   PRIMER_WARMUP_TIMEOUT   Seconds to wait for warmup marker (default: 60)
