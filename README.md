@@ -99,6 +99,7 @@ alias cc='primer attach'    # two keystrokes to a warm session
 | Variable | Default | Description |
 |---|---|---|
 | `PRIMER_CLI` | `claude` | CLI command to launch (e.g. `aider`, `ollama run llama3`, `llm`) |
+| `PRIMER_RESET_CMD` | `/clear` | Command to reset session context. Set to `""` to kill+respawn instead (for CLIs with no soft-reset) |
 | `PRIMER_MODE` | `lazy` | `lazy` or `eager` |
 | `PRIMER_POOL_SIZE` | `2` | Max sessions in the pool |
 | `PRIMER_DIR` | `~/.llm-primer` | State + log directory |
