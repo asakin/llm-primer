@@ -2,6 +2,10 @@
 
 Run through this before any public release. Each section is independent — you can run them in any order, but Prerequisites must pass first.
 
+**Two passes required before release:**
+1. **Human pass** — you run through this manually, section by section
+2. **AI pass** — after human pass, wipe everything (`primerd stop`, remove binaries, `rm -rf ~/.llm-primer`) and hand this file to Claude Code. It runs the curl-pipe installer and sections 2–6 end-to-end. If Claude Code can install and attach to a warm session without help, it's ready for the public.
+
 ---
 
 ## Prerequisites
