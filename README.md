@@ -64,7 +64,7 @@ primerd start
 
 **macOS:**
 ```bash
-brew tap asakin/llm-primer https://github.com/asakin/llm-primer
+brew tap asakin/llm-primer
 brew install llm-primer
 ```
 
