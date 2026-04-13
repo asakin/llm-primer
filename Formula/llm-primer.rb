@@ -1,10 +1,10 @@
 class LlmPrimer < Formula
   desc "Keep pre-warmed Claude Code sessions ready in tmux"
   homepage "https://github.com/asakin/llm-primer"
-  url "https://github.com/asakin/llm-primer/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "23fe1fe2c88fffd46173efea9329abfdb1d3338c2883dd38893ae409b3eb1e5a"
+  url "https://github.com/asakin/llm-primer/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "75b9e1458c99cad8c6b7795ee40bf3cc46349de57dca5e6deebf8766b5a5128b"
   license "MIT"
-  version "0.1.0"
+  version "0.4.0"
 
   depends_on "tmux"
 
