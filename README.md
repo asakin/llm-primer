@@ -2,13 +2,25 @@
 
 No more waiting for your LLM CLI to boot.
 
-llm-primer keeps pre-warmed sessions ready in tmux — Claude Code, Aider, Ollama, Gemini CLI, or anything with a startup protocol. When you need a session, you get one instantly — fully initialized, context already loaded, ready to type.
+Every LLM CLI session starts cold. For a bare setup that's a few seconds — annoying but livable. For an LLM wiki (a `CLAUDE.md` with a session-start protocol, spend checks, inbox review, publishing signals) it can be 30–60 seconds of waiting every single time before you can type.
+
+llm-primer keeps sessions pre-warmed in tmux. The startup protocol runs in the background; when you want a session you get one instantly, fully initialized.
 
 ```bash
 primerd start    # start the daemon
 primer attach    # get a warm session instantly
 primer alt       # get the alt session (fast model, different tool — you configure it)
 ```
+
+Works with any LLM CLI: Claude Code, Aider, Ollama, Gemini CLI, Simon Willison's `llm`. If your CLI takes >5s to boot, this helps.
+
+---
+
+## Why this exists
+
+Built while developing [llm-context-base](https://github.com/asakin/llm-context-base), an LLM wiki framework whose sessions take 30–60s to initialize because the AI reads your profile, config, inbox state, publishing calendar, and more on every startup. Waiting every time was untenable.
+
+It's not llm-context-base-specific — anything with a slow-ish startup benefits. But if you're running an LLM wiki today, you already know the pain.
 
 ---
 
@@ -194,6 +206,20 @@ The installer will ask if you want to set up a launchd agent (macOS) so primerd 
 
 **Requires:** `tmux` and whatever CLI you're using.
 
+### Note on existing shell aliases
+
+If you already have a shell alias or function wrapping your CLI that auto-sends a greeting (e.g. `claude()  { command claude "Hi" "$@"; }`), it will collide with primer's warmup message — you'll get two greetings per session.
+
+Two ways to fix:
+
+1. **Drop the alias.** Primer's `PRIMER_WARMUP_MSG` does the same thing, and the new default tells the LLM it's running in primer — which is better than "Hi".
+2. **Bypass the alias in `PRIMER_CLI`.** Use `command` or an absolute path:
+   ```ini
+   PRIMER_CLI=command claude
+   # or
+   PRIMER_CLI=/opt/homebrew/bin/claude
+   ```
+
 ---
 
 ## Open on every terminal
@@ -228,7 +254,7 @@ primer gc ~/path/to/vault --auto    # move stray files to _inbox/
 primer gc ~/path/to/vault --lint    # flag frontmatter issues + duplicate slugs only
 ```
 
-**What's stray:** any `.md` file not in `_inbox/`, `_output/`, a `_*` directory, a named content directory (`0-Ideas/`, `1-Projects/`, etc.), or a known root-level file (`README.md`, `CLAUDE.md`, etc.).
+**What's stray:** any `.md` file not in a `_*` directory, not in a named content directory (`0-Ideas/`, `1-Projects/`, etc.), and not a known root-level file (`README.md`, `CLAUDE.md`, etc.).
 
 **Never moved:** files in `_*` directories, assets (`.png`, `.pdf`, `.sh`, etc.), symlinks.
 
@@ -319,6 +345,38 @@ If your tool has no soft-reset command, set `PRIMER_RESET_CMD=""` and primerd wi
 - **bash + tmux only.** VSCode/Cursor integrated terminal users: this won't work there. WSL2 works; native Windows doesn't.
 - **macOS `stat` flags.** The config file watcher uses `stat -f` (macOS) with a Linux fallback. If the watcher fails silently on your distro, open an issue.
 - **Eager mode token cost.** Warm sessions already ran the startup protocol. In lazy mode this doesn't happen until needed.
+
+---
+
+## Troubleshooting
+
+**`pool: no tmux session found`**
+Run `primerd start` first. If the launchd agent is installed but the pool is missing, the daemon may have crashed — check `primer logs`.
+
+**Warmup times out (slot stays `warming` or goes to `stale`)**
+Your CLI's output probably doesn't contain the default `SESSION START` marker. Set `PRIMER_WARMUP_MARKER` to a string that actually appears when your CLI is ready:
+```ini
+PRIMER_WARMUP_MARKER=Aider v   # for Aider
+PRIMER_WARMUP_MARKER=>>>       # for Python REPL
+```
+
+**`primer attach` says "Pool session not found"**
+primerd isn't running. Start it: `primerd start`. If you set up the launchd agent, check `launchctl list | grep primerd`.
+
+**Config file changes aren't picked up**
+Env vars always beat the config file. If you have `PRIMER_POOL_SIZE` exported somewhere, unset it or restart your shell. Or use `env -u PRIMER_POOL_SIZE primerd start` to verify the file value.
+
+**Weird state after a crash**
+Nuke the tmux session and restart:
+```bash
+primerd stop
+tmux kill-session -t primer-pool
+rm -rf ~/.llm-primer/state
+primerd start
+```
+
+**Two greetings per session**
+You probably have a shell alias/function around `claude` (or whatever CLI) that sends a greeting. See "Note on existing shell aliases" above.
 
 ---
 
