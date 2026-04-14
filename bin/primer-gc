@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# primer-gc — llm-primer garbage collector
+#
+# Scans a vault directory for files that ended up in the wrong place and
+# moves them into _inbox/ so they can flow through the normal filing process.
+#
+# Usage:
+#   primer-gc --vault /path/to/vault           # dry run (show what would move)
+#   primer-gc --vault /path/to/vault --auto    # move stray files automatically
+#   primer-gc --vault /path/to/vault --lint    # flag frontmatter issues only
+#   primer gc /path/to/vault                   # via primer CLI wrapper
+#
+# Invoked automatically by primerd when PRIMER_GC_VAULT is set.
+
+set -euo pipefail
+
+# ── defaults ──────────────────────────────────────────────────────────────────
+
+VAULT=""
+AUTO=false
+LINT_ONLY=false
+VERBOSE=false
+
+# Built-in defaults — shaped like llm-context-base because that's the common
+# case. Override any of them per-vault by dropping a `.primer-gc` file at the
+# vault root. See load_vault_policy() below.
+
+DEFAULT_ALLOWED_ROOT_FILES=(
+  "README.md"
+  "PHILOSOPHY.md"
+  "CLAUDE.md"
+  "GEMINI.md"
+  "AGENTS.md"
+  "CURSOR.md"
+  "COPILOT.md"
+  "LICENSE"
+  "LICENSE.md"
+  "CONTRIBUTING.md"
+  "CHANGELOG.md"
+)
+
+DEFAULT_ALLOWED_DIRS=(
+  "0-Ideas"
+  "1-Projects"
+  "2-Knowledge"
+  "3-Journal"
+  "4-Private"
+  "5-Publishing"
+  "6-Experiments"
+  "7-Family"
+  "docs"
+  "examples"
+)
+
+DEFAULT_ASSET_EXTENSIONS=(png jpg jpeg gif svg webp pdf mp4 mov mp3
+                          zip tar gz sh py js ts go rb json toml
+                          yaml yml css html txt csv)
+
+DEFAULT_INBOX_DIR="_inbox"
+DEFAULT_FILENAME_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$'
+DEFAULT_LINT_SKIP_DIRS=("_inbox")
+
+# Directories skipped during the scan. Default covers common dev artifacts
+# (node_modules, venv-style) plus any top-level dotdir (.git, .claude, .venv,
+# .obsidian, etc.). Extend via SCAN_EXCLUDE_DIRS in the policy file.
+DEFAULT_SCAN_EXCLUDE_DIRS=(node_modules _tools target build dist)
+
+# These get populated by load_vault_policy() — empty until the vault is known.
+ALLOWED_ROOT_FILES=()
+ALLOWED_DIRS=()
+ASSET_EXTENSIONS=()
+LINT_SKIP_DIRS=()
+SCAN_EXCLUDE_DIRS=()
+INBOX_DIR=""
+FILENAME_REGEX=""
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vault|-v)
+      VAULT="$2"
+      shift 2
+      ;;
+    --auto|-a)
+      AUTO=true
+      shift
+      ;;
+    --lint|-l)
+      LINT_ONLY=true
+      shift
+      ;;
+    --verbose)
+      VERBOSE=true
+      shift
+      ;;
+    --help|-h)
+      cat <<'HELP'
+primer-gc — llm-primer garbage collector
+
+Finds files that drifted into the wrong place in your vault and moves them
+into _inbox/ so they flow through the normal filing process.
+
+Usage:
+  primer-gc --vault <path>              Dry run — show what would be moved
+  primer-gc --vault <path> --auto       Move stray files automatically
+  primer-gc --vault <path> --lint       Flag frontmatter and naming issues only
+  primer-gc --vault <path> --verbose    Show all files checked
+
+Options:
+  --vault, -v   Path to vault root (required)
+  --auto, -a    Move stray files without prompting
+  --lint, -l    Frontmatter and naming checks only (no file moves)
+  --verbose     Print every file checked
+  --help        Show this help
+
+What counts as "stray":
+  Any .md file that is:
+  - Not in _inbox/, _output/, _meta/, _config/, _divergence/, _seeds/, or any _* dir
+  - Not in a named allowed directory (0-Ideas/, 1-Projects/, etc.)
+  - Not a known root-level file (README.md, PHILOSOPHY.md, CLAUDE.md, etc.)
+
+Exceptions (never moved):
+  - Files in any _* directory
+  - Asset files (.png, .pdf, .sh, .py, etc.)
+  - Files in explicitly allowed directories (configurable via GC_ALLOWED_DIRS)
+  - Symlinks
+
+Additional checks (--lint):
+  - .md files without a frontmatter block (--- ... ---)
+  - .md files with dates that don't match the YYYY-MM-DD-slug.md naming standard
+  - Duplicate file slugs across the vault
+HELP
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1. Run 'primer-gc --help' for usage." >&2
+      exit 1
+      ;;
+  esac
+done
+
+[[ -z "$VAULT" ]] && { echo "error: --vault is required" >&2; exit 1; }
+[[ -d "$VAULT" ]] || { echo "error: vault not found: $VAULT" >&2; exit 1; }
+
+# ── policy loading ────────────────────────────────────────────────────────────
+#
+# Vaults customize the GC by dropping a `.primer-gc` file at the vault root.
+# Same plain-KEY=value format as ~/.llm-primer/config. Every field is optional;
+# unset fields fall back to the built-in defaults. Supported keys:
+#
+#   ALLOWED_DIRS         comma-separated top-level dirs where .md is allowed
+#   ALLOWED_ROOT_FILES   comma-separated root-level file names allowed as-is
+#   LINT_SKIP_DIRS       comma-separated dirs where frontmatter lint is skipped
+#   FILENAME_REGEX       regex that filenames must match (empty = skip check)
+#   INBOX_DIR            where strays are moved (default _inbox)
+#   ASSET_EXTENSIONS     comma-separated extensions that are always allowed
+#
+# Env vars (GC_ALLOWED_DIRS, GC_LINT_SKIP_DIRS) still work as additive extras
+# layered on top of the policy file + defaults, for one-shot overrides.
+
+_POLICY_FILE="$VAULT/.primer-gc"
+
+# Look up a policy key by grepping the file. Bash 3.2 compatible (no assoc arrays).
+# Returns empty string if file doesn't exist or key not found.
+_policy_get() {
+  local key="$1"
+  [[ -f "$_POLICY_FILE" ]] || { echo ""; return; }
+  # Match KEY=value, strip the key prefix, take the rest of the line.
+  # Ignores commented lines.
+  local line
+  line=$(grep -E "^[[:space:]]*${key}=" "$_POLICY_FILE" 2>/dev/null | grep -v '^[[:space:]]*#' | head -1)
+  [[ -z "$line" ]] && { echo ""; return; }
+  echo "${line#*=}"
+}
+
+# Populate a list variable from policy file or fall back to defaults.
+# Arg 1: target array name (passed via nameref workaround since bash 3 has no nameref)
+# Arg 2: policy key to look up
+# Arg 3+: default items
+_populate_list() {
+  local policy_key="$1"; shift
+  local raw
+  raw=$(_policy_get "$policy_key")
+  if [[ -n "$raw" ]]; then
+    IFS=',' read -ra _tmp <<< "$raw"
+    printf '%s\n' "${_tmp[@]}"
+  else
+    printf '%s\n' "$@"
+  fi
+}
+
+while IFS= read -r item; do ALLOWED_ROOT_FILES+=("$item"); done < <(_populate_list ALLOWED_ROOT_FILES "${DEFAULT_ALLOWED_ROOT_FILES[@]}")
+while IFS= read -r item; do ALLOWED_DIRS+=("$item"); done       < <(_populate_list ALLOWED_DIRS       "${DEFAULT_ALLOWED_DIRS[@]}")
+while IFS= read -r item; do ASSET_EXTENSIONS+=("$item"); done   < <(_populate_list ASSET_EXTENSIONS   "${DEFAULT_ASSET_EXTENSIONS[@]}")
+while IFS= read -r item; do LINT_SKIP_DIRS+=("$item"); done     < <(_populate_list LINT_SKIP_DIRS     "${DEFAULT_LINT_SKIP_DIRS[@]}")
+while IFS= read -r item; do SCAN_EXCLUDE_DIRS+=("$item"); done  < <(_populate_list SCAN_EXCLUDE_DIRS  "${DEFAULT_SCAN_EXCLUDE_DIRS[@]}")
+
+INBOX_DIR=$(_policy_get INBOX_DIR);           [[ -z "$INBOX_DIR" ]]      && INBOX_DIR="$DEFAULT_INBOX_DIR"
+FILENAME_REGEX=$(_policy_get FILENAME_REGEX); [[ -z "$FILENAME_REGEX" ]] && FILENAME_REGEX="$DEFAULT_FILENAME_REGEX"
+
+# Env-var additive extras (layered on top, still work)
+if [[ -n "${GC_ALLOWED_DIRS:-}" ]]; then
+  IFS=',' read -ra _extra <<< "$GC_ALLOWED_DIRS"
+  ALLOWED_DIRS+=("${_extra[@]}")
+fi
+if [[ -n "${GC_LINT_SKIP_DIRS:-}" ]]; then
+  IFS=',' read -ra _extra <<< "$GC_LINT_SKIP_DIRS"
+  LINT_SKIP_DIRS+=("${_extra[@]}")
+fi
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+log()  { echo "$(date '+%Y-%m-%d %H:%M:%S') gc: $*"; }
+info() { echo "  → $*"; }
+warn() { echo "  ⚠ $*"; }
+
+is_asset() {
+  local file="$1"
+  local ext="${file##*.}"
+  for a in "${ASSET_EXTENSIONS[@]}"; do
+    [[ "$ext" == "$a" ]] && return 0
+  done
+  return 1
+}
+
+is_allowed_path() {
+  local rel="$1"   # path relative to vault root
+
+  # Root-level files (no directory separator)
+  if [[ "$rel" != */* ]]; then
+    local base
+    base=$(basename "$rel")
+    for f in "${ALLOWED_ROOT_FILES[@]}"; do
+      [[ "$base" == "$f" ]] && return 0
+    done
+    # Anything directly at root that isn't a known file is stray
+    return 1
+  fi
+
+  # Extract top-level directory
+  local topdir
+  topdir="${rel%%/*}"
+
+  # Any _* directory is always allowed
+  [[ "$topdir" == _* ]] && return 0
+
+  # Named allowed directories
+  for d in "${ALLOWED_DIRS[@]}"; do
+    [[ "$topdir" == "$d" ]] && return 0
+  done
+
+  return 1
+}
+
+has_frontmatter() {
+  local file="$1"
+  head -1 "$file" 2>/dev/null | grep -q "^---"
+}
+
+should_lint() {
+  local rel="$1"
+  local topdir="${rel%%/*}"
+  for d in "${LINT_SKIP_DIRS[@]}"; do
+    [[ "$topdir" == "$d" ]] && return 1
+  done
+  return 0
+}
+
+matches_naming_standard() {
+  local base="$1"
+  # Standard: YYYY-MM-DD-slug.md (lowercase, hyphens)
+  [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$ ]]
+}
+
+# ── inbox move ────────────────────────────────────────────────────────────────
+
+move_to_inbox() {
+  local file="$1"
+  local inbox="$VAULT/$INBOX_DIR"
+  mkdir -p "$inbox"
+
+  local base
+  base=$(basename "$file")
+  local today
+  today=$(date '+%Y-%m-%d')
+
+  # Prefix with today's date if not already dated
+  local target_name
+  if [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    target_name="$base"
+  else
+    # Slugify: lowercase, replace spaces with hyphens
+    local slug
+    slug=$(echo "$base" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+    target_name="${today}-${slug}"
+  fi
+
+  local target="$inbox/$target_name"
+
+  # Avoid clobbering existing inbox file
+  if [[ -f "$target" ]]; then
+    target="$inbox/${today}-gc-$(basename "$file")"
+  fi
+
+  if $AUTO; then
+    mv "$file" "$target"
+    log "MOVED: $file → _inbox/$(basename "$target")"
+  else
+    info "would move: $file → _inbox/$(basename "$target")"
+  fi
+}
+
+# ── main scan ─────────────────────────────────────────────────────────────────
+
+stray_count=0
+lint_count=0
+moved_count=0
+
+log "Scanning vault: $VAULT"
+$AUTO && log "Mode: auto (files will be moved)"
+$LINT_ONLY && log "Mode: lint only (no moves)"
+
+# Build a list of -prune clauses for find: all top-level dotdirs + the
+# configured SCAN_EXCLUDE_DIRS. Keeps the scan out of .git, .claude, node_modules,
+# etc. so git-worktree artifacts and vendored deps don't show up as strays.
+_scan_prunes=(-path "$VAULT/.*" -o)
+for d in "${SCAN_EXCLUDE_DIRS[@]}"; do
+  _scan_prunes+=(-path "$VAULT/$d" -o -path "$VAULT/$d/*" -o)
+done
+# Strip trailing -o
+unset '_scan_prunes[${#_scan_prunes[@]}-1]'
+
+_find_md() {
+  find "$VAULT" \( "${_scan_prunes[@]}" \) -prune -o -name "*.md" -type f -print0
+}
+
+# Find all .md files, skipping dotdirs and excluded trees
+while IFS= read -r -d '' file; do
+  # Skip symlinks
+  [[ -L "$file" ]] && continue
+
+  rel="${file#$VAULT/}"
+
+  $VERBOSE && info "checking: $rel"
+
+  # Asset check (by extension)
+  is_asset "$rel" && continue
+
+  # ── stray check ──
+  if ! $LINT_ONLY && ! is_allowed_path "$rel"; then
+    stray_count=$((stray_count + 1))
+    if $AUTO; then
+      move_to_inbox "$file"
+      moved_count=$((moved_count + 1))
+    else
+      warn "STRAY: $rel"
+    fi
+    continue
+  fi
+
+  # ── lint checks (skip dirs where frontmatter isn't expected, e.g. _inbox) ──
+  if should_lint "$rel" && ! has_frontmatter "$file"; then
+    lint_count=$((lint_count + 1))
+    warn "NO FRONTMATTER: $rel"
+  fi
+
+done < <(_find_md)
+
+# ── duplicate slug check ──────────────────────────────────────────────────────
+# Bash 3-compatible: collect all slugs into a temp file, then find duplicates
+# using sort + uniq rather than an associative array.
+
+log "Checking for duplicate slugs..."
+_slug_tmp=$(mktemp)
+trap 'rm -f "$_slug_tmp"' RETURN 2>/dev/null || true
+
+while IFS= read -r -d '' file; do
+  [[ -L "$file" ]] && continue
+  _slug_base=$(basename "$file" .md)
+  _slug="${_slug_base#????-??-??-}"   # strip YYYY-MM-DD- prefix if present
+  printf '%s\t%s\n' "$_slug" "$file"  # tab-separated: slug TAB path
+done < <(_find_md) > "$_slug_tmp"
+
+# Find slugs that appear more than once
+while IFS= read -r dup_slug; do
+  lint_count=$((lint_count + 1))
+  # Find all files with this slug (match whole first field)
+  matching=$(awk -F'\t' -v s="$dup_slug" '$1==s{printf "%s ", $2}' "$_slug_tmp")
+  warn "DUPLICATE SLUG '$dup_slug': $matching"
+done < <(cut -f1 "$_slug_tmp" | sort | uniq -d)
+
+rm -f "$_slug_tmp"
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo "── GC Summary ─────────────────────────────────────────────"
+if $AUTO; then
+  echo "  Moved to _inbox: $moved_count"
+else
+  echo "  Stray files found: $stray_count"
+  [[ $stray_count -gt 0 ]] && echo "  Run with --auto to move them to _inbox/"
+fi
+echo "  Lint issues found: $lint_count"
+[[ $lint_count -gt 0 ]] && echo "  (no-frontmatter files and duplicate slugs — fix manually)"
+echo "───────────────────────────────────────────────────────────"
+
+[[ $stray_count -gt 0 ]] && ! $AUTO && exit 2
+[[ $lint_count -gt 0 ]] && exit 3
+exit 0
