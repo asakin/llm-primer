@@ -51,7 +51,18 @@ PRIMER_MODE="${PRIMER_MODE:-lazy}"           # lazy | eager
 PRIMER_CLI="${PRIMER_CLI:-claude}"           # CLI for all slots unless overridden
 
 PRIMER_RESET_CMD="${PRIMER_RESET_CMD:-/clear}"   # soft-reset command; "" = kill+respawn
-PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"  # message sent to trigger init protocol
+
+# The message sent to trigger the LLM's startup protocol. This runs as the
+# first user turn in every warm session, so we use it to tell the LLM what
+# it's running in — which makes it a better collaborator (e.g. it can suggest
+# 'primer switch' proactively when context gets heavy).
+_default_warmup_msg='Hi, you are running inside llm-primer, a pre-warmed session pool. When my context gets heavy — around 70% of your window — remind me I can run `primer switch` to jump cleanly to a fresh session. Now please run your session start protocol.'
+PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-$_default_warmup_msg}"
+
+# Override for the alt slot (falls back to PRIMER_WARMUP_MSG if unset).
+# Good for telling the cheap/fast model to keep answers short.
+PRIMER_ALT_WARMUP_MSG="${PRIMER_ALT_WARMUP_MSG:-}"
+
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"  # string that signals warmth
 PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"  # seconds to wait for warm marker
 
@@ -128,6 +139,15 @@ is_alt_slot() {
   [[ "$slot" -eq "$alt_slot" ]]
 }
 
+slot_warmup_msg() {
+  local slot="$1"
+  if is_alt_slot "$slot" && [[ -n "$PRIMER_ALT_WARMUP_MSG" ]]; then
+    echo "$PRIMER_ALT_WARMUP_MSG"
+  else
+    echo "$PRIMER_WARMUP_MSG"
+  fi
+}
+
 # ── tmux helpers ──────────────────────────────────────────────────────────────
 
 window_name() { echo "${PRIMER_SESSION_PREFIX}-$1"; }
@@ -196,7 +216,7 @@ warm_window() {
     sleep 2
   fi
 
-  send_keys "$window" "$PRIMER_WARMUP_MSG"
+  send_keys "$window" "$(slot_warmup_msg "$slot")"
 
   local waited=0
   while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
@@ -237,7 +257,7 @@ rewarm_window() {
     sleep 2
   fi
 
-  send_keys "$window" "$PRIMER_WARMUP_MSG"
+  send_keys "$window" "$(slot_warmup_msg "$slot")"
 
   local waited=0
   while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
@@ -529,8 +549,17 @@ PRIMER_POOL_SIZE=3
 PRIMER_ALT_CLI=
 # PRIMER_ALT_SLOT=2   # which slot (default: last slot in pool)
 
+# ── warmup message ────────────────────────────────────────────────────────────
+# The first user turn sent to the LLM when warming a slot. The default tells
+# the LLM it's running under llm-primer so it can suggest `primer switch` when
+# context gets heavy. Override if your CLI expects a specific trigger phrase.
+#
+# PRIMER_WARMUP_MSG=Hi — you're running inside llm-primer...
+#
+# Optional override just for the alt slot. Useful for cheap/fast models:
+# PRIMER_ALT_WARMUP_MSG=Hi — you're the alt slot (cheap/fast model). Keep answers short unless asked otherwise. Please run your session start protocol.
+
 # ── warmup detection ──────────────────────────────────────────────────────────
-# PRIMER_WARMUP_MSG=ready
 # PRIMER_WARMUP_MARKER=SESSION START
 # PRIMER_WARMUP_TIMEOUT=60
 
