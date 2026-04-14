@@ -21,10 +21,11 @@ AUTO=false
 LINT_ONLY=false
 VERBOSE=false
 
-# Directories where .md files are always allowed.
-# Any directory whose name starts with _ is automatically allowed.
-# Root-level files with these exact names are always allowed.
-ALLOWED_ROOT_FILES=(
+# Built-in defaults — shaped like llm-context-base because that's the common
+# case. Override any of them per-vault by dropping a `.primer-gc` file at the
+# vault root. See load_vault_policy() below.
+
+DEFAULT_ALLOWED_ROOT_FILES=(
   "README.md"
   "PHILOSOPHY.md"
   "CLAUDE.md"
@@ -38,9 +39,7 @@ ALLOWED_ROOT_FILES=(
   "CHANGELOG.md"
 )
 
-# Top-level directories where .md files are always allowed.
-# Any _* directory is auto-allowed. These are the named ones.
-ALLOWED_DIRS=(
+DEFAULT_ALLOWED_DIRS=(
   "0-Ideas"
   "1-Projects"
   "2-Knowledge"
@@ -53,10 +52,21 @@ ALLOWED_DIRS=(
   "examples"
 )
 
-# File extensions considered "assets" — never moved regardless of location.
-ASSET_EXTENSIONS=("png" "jpg" "jpeg" "gif" "svg" "webp" "pdf" "mp4" "mov" "mp3"
-                  "zip" "tar" "gz" "sh" "py" "js" "ts" "go" "rb" "json" "toml"
-                  "yaml" "yml" "css" "html" "txt" "csv")
+DEFAULT_ASSET_EXTENSIONS=(png jpg jpeg gif svg webp pdf mp4 mov mp3
+                          zip tar gz sh py js ts go rb json toml
+                          yaml yml css html txt csv)
+
+DEFAULT_INBOX_DIR="_inbox"
+DEFAULT_FILENAME_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$'
+DEFAULT_LINT_SKIP_DIRS=("_inbox")
+
+# These get populated by load_vault_policy() — empty until the vault is known.
+ALLOWED_ROOT_FILES=()
+ALLOWED_DIRS=()
+ASSET_EXTENSIONS=()
+LINT_SKIP_DIRS=()
+INBOX_DIR=""
+FILENAME_REGEX=""
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 
@@ -127,10 +137,69 @@ done
 [[ -z "$VAULT" ]] && { echo "error: --vault is required" >&2; exit 1; }
 [[ -d "$VAULT" ]] || { echo "error: vault not found: $VAULT" >&2; exit 1; }
 
-# Support additional allowed dirs from env
+# ── policy loading ────────────────────────────────────────────────────────────
+#
+# Vaults customize the GC by dropping a `.primer-gc` file at the vault root.
+# Same plain-KEY=value format as ~/.llm-primer/config. Every field is optional;
+# unset fields fall back to the built-in defaults. Supported keys:
+#
+#   ALLOWED_DIRS         comma-separated top-level dirs where .md is allowed
+#   ALLOWED_ROOT_FILES   comma-separated root-level file names allowed as-is
+#   LINT_SKIP_DIRS       comma-separated dirs where frontmatter lint is skipped
+#   FILENAME_REGEX       regex that filenames must match (empty = skip check)
+#   INBOX_DIR            where strays are moved (default _inbox)
+#   ASSET_EXTENSIONS     comma-separated extensions that are always allowed
+#
+# Env vars (GC_ALLOWED_DIRS, GC_LINT_SKIP_DIRS) still work as additive extras
+# layered on top of the policy file + defaults, for one-shot overrides.
+
+_POLICY_FILE="$VAULT/.primer-gc"
+
+# Look up a policy key by grepping the file. Bash 3.2 compatible (no assoc arrays).
+# Returns empty string if file doesn't exist or key not found.
+_policy_get() {
+  local key="$1"
+  [[ -f "$_POLICY_FILE" ]] || { echo ""; return; }
+  # Match KEY=value, strip the key prefix, take the rest of the line.
+  # Ignores commented lines.
+  local line
+  line=$(grep -E "^[[:space:]]*${key}=" "$_POLICY_FILE" 2>/dev/null | grep -v '^[[:space:]]*#' | head -1)
+  [[ -z "$line" ]] && { echo ""; return; }
+  echo "${line#*=}"
+}
+
+# Populate a list variable from policy file or fall back to defaults.
+# Arg 1: target array name (passed via nameref workaround since bash 3 has no nameref)
+# Arg 2: policy key to look up
+# Arg 3+: default items
+_populate_list() {
+  local policy_key="$1"; shift
+  local raw
+  raw=$(_policy_get "$policy_key")
+  if [[ -n "$raw" ]]; then
+    IFS=',' read -ra _tmp <<< "$raw"
+    printf '%s\n' "${_tmp[@]}"
+  else
+    printf '%s\n' "$@"
+  fi
+}
+
+while IFS= read -r item; do ALLOWED_ROOT_FILES+=("$item"); done < <(_populate_list ALLOWED_ROOT_FILES "${DEFAULT_ALLOWED_ROOT_FILES[@]}")
+while IFS= read -r item; do ALLOWED_DIRS+=("$item"); done       < <(_populate_list ALLOWED_DIRS       "${DEFAULT_ALLOWED_DIRS[@]}")
+while IFS= read -r item; do ASSET_EXTENSIONS+=("$item"); done   < <(_populate_list ASSET_EXTENSIONS   "${DEFAULT_ASSET_EXTENSIONS[@]}")
+while IFS= read -r item; do LINT_SKIP_DIRS+=("$item"); done     < <(_populate_list LINT_SKIP_DIRS     "${DEFAULT_LINT_SKIP_DIRS[@]}")
+
+INBOX_DIR=$(_policy_get INBOX_DIR);           [[ -z "$INBOX_DIR" ]]      && INBOX_DIR="$DEFAULT_INBOX_DIR"
+FILENAME_REGEX=$(_policy_get FILENAME_REGEX); [[ -z "$FILENAME_REGEX" ]] && FILENAME_REGEX="$DEFAULT_FILENAME_REGEX"
+
+# Env-var additive extras (layered on top, still work)
 if [[ -n "${GC_ALLOWED_DIRS:-}" ]]; then
-  IFS=',' read -ra extra_dirs <<< "$GC_ALLOWED_DIRS"
-  ALLOWED_DIRS+=("${extra_dirs[@]}")
+  IFS=',' read -ra _extra <<< "$GC_ALLOWED_DIRS"
+  ALLOWED_DIRS+=("${_extra[@]}")
+fi
+if [[ -n "${GC_LINT_SKIP_DIRS:-}" ]]; then
+  IFS=',' read -ra _extra <<< "$GC_LINT_SKIP_DIRS"
+  LINT_SKIP_DIRS+=("${_extra[@]}")
 fi
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -182,14 +251,6 @@ has_frontmatter() {
   head -1 "$file" 2>/dev/null | grep -q "^---"
 }
 
-# Dirs where frontmatter is not required (landing zones, raw captures).
-# Extend via GC_LINT_SKIP_DIRS=foo,bar env var.
-LINT_SKIP_DIRS=("_inbox")
-if [[ -n "${GC_LINT_SKIP_DIRS:-}" ]]; then
-  IFS=',' read -ra _lint_extra <<< "$GC_LINT_SKIP_DIRS"
-  LINT_SKIP_DIRS+=("${_lint_extra[@]}")
-fi
-
 should_lint() {
   local rel="$1"
   local topdir="${rel%%/*}"
@@ -209,7 +270,7 @@ matches_naming_standard() {
 
 move_to_inbox() {
   local file="$1"
-  local inbox="$VAULT/_inbox"
+  local inbox="$VAULT/$INBOX_DIR"
   mkdir -p "$inbox"
 
   local base

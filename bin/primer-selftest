@@ -305,6 +305,42 @@ assert_contains "gc: lint flags duplicate slugs" "DUPLICATE SLUG" "$output"
 [[ "$output" != *"README.md"* ]] && _pass "gc: README.md not flagged as stray" || \
   _fail "gc: README.md incorrectly flagged"
 
+# ── test: .primer-gc policy file overrides defaults ──────────────────────────
+
+# Build a second vault with a custom policy: a dir name that isn't in defaults
+# should be allowed when listed in .primer-gc, and the default "1-Projects"
+# should become stray when it's not listed.
+
+VAULT2="$TEST_DIR/vault2"
+mkdir -p "$VAULT2/notes/2026" "$VAULT2/1-Projects" "$VAULT2/_inbox"
+
+echo "---" > "$VAULT2/notes/2026/note.md"       # should be allowed per policy
+echo "---" > "$VAULT2/1-Projects/p.md"           # should be stray per policy
+
+# Policy: only allow "notes", drop the SakinOS-style dirs
+cat > "$VAULT2/.primer-gc" <<'POLICY'
+ALLOWED_DIRS=notes
+ALLOWED_ROOT_FILES=README.md
+POLICY
+
+output=$("$PRIMER_GC" --vault "$VAULT2" 2>&1) || true
+[[ "$output" != *"notes/2026/note.md"* ]] && _pass "gc: policy ALLOWED_DIRS permits 'notes/'" || \
+  _fail "gc: policy did not permit 'notes/' (note.md got flagged)"
+[[ "$output" == *"1-Projects/p.md"* ]] && _pass "gc: policy overrides defaults (1-Projects now stray)" || \
+  _fail "gc: policy did not override defaults (1-Projects still allowed)"
+
+# Custom INBOX_DIR
+VAULT3="$TEST_DIR/vault3"
+mkdir -p "$VAULT3/incoming" "$VAULT3/random"
+echo "---" > "$VAULT3/random/stray.md"
+cat > "$VAULT3/.primer-gc" <<'POLICY'
+ALLOWED_DIRS=notes
+INBOX_DIR=incoming
+POLICY
+
+"$PRIMER_GC" --vault "$VAULT3" --auto > /dev/null 2>&1 || true
+assert_file_exists "gc: policy INBOX_DIR routes strays to custom dir" "$VAULT3/incoming/$(ls "$VAULT3/incoming" 2>/dev/null | head -1)"
+
 # ── test: help outputs ────────────────────────────────────────────────────────
 
 section "help"
