@@ -182,6 +182,23 @@ has_frontmatter() {
   head -1 "$file" 2>/dev/null | grep -q "^---"
 }
 
+# Dirs where frontmatter is not required (landing zones, raw captures).
+# Extend via GC_LINT_SKIP_DIRS=foo,bar env var.
+LINT_SKIP_DIRS=("_inbox")
+if [[ -n "${GC_LINT_SKIP_DIRS:-}" ]]; then
+  IFS=',' read -ra _lint_extra <<< "$GC_LINT_SKIP_DIRS"
+  LINT_SKIP_DIRS+=("${_lint_extra[@]}")
+fi
+
+should_lint() {
+  local rel="$1"
+  local topdir="${rel%%/*}"
+  for d in "${LINT_SKIP_DIRS[@]}"; do
+    [[ "$topdir" == "$d" ]] && return 1
+  done
+  return 0
+}
+
 matches_naming_standard() {
   local base="$1"
   # Standard: YYYY-MM-DD-slug.md (lowercase, hyphens)
@@ -260,8 +277,8 @@ while IFS= read -r -d '' file; do
     continue
   fi
 
-  # ── lint checks (run on all .md files in allowed locations) ──
-  if ! has_frontmatter "$file"; then
+  # ── lint checks (skip dirs where frontmatter isn't expected, e.g. _inbox) ──
+  if should_lint "$rel" && ! has_frontmatter "$file"; then
     lint_count=$((lint_count + 1))
     warn "NO FRONTMATTER: $rel"
   fi
@@ -269,21 +286,29 @@ while IFS= read -r -d '' file; do
 done < <(find "$VAULT" -name "*.md" -not -path "*/.git/*" -print0)
 
 # ── duplicate slug check ──────────────────────────────────────────────────────
+# Bash 3-compatible: collect all slugs into a temp file, then find duplicates
+# using sort + uniq rather than an associative array.
 
 log "Checking for duplicate slugs..."
-declare -A seen_slugs
+_slug_tmp=$(mktemp)
+trap 'rm -f "$_slug_tmp"' RETURN 2>/dev/null || true
+
 while IFS= read -r -d '' file; do
   [[ -L "$file" ]] && continue
-  base=$(basename "$file" .md)
-  # Strip date prefix for slug comparison
-  slug="${base#????-??-??-}"
-  if [[ -n "${seen_slugs[$slug]:-}" ]]; then
-    lint_count=$((lint_count + 1))
-    warn "DUPLICATE SLUG '$slug': $file  (also: ${seen_slugs[$slug]})"
-  else
-    seen_slugs["$slug"]="$file"
-  fi
-done < <(find "$VAULT" -name "*.md" -not -path "*/.git/*" -print0)
+  _slug_base=$(basename "$file" .md)
+  _slug="${_slug_base#????-??-??-}"   # strip YYYY-MM-DD- prefix if present
+  printf '%s\t%s\n' "$_slug" "$file"  # tab-separated: slug TAB path
+done < <(find "$VAULT" -name "*.md" -not -path "*/.git/*" -print0) > "$_slug_tmp"
+
+# Find slugs that appear more than once
+while IFS= read -r dup_slug; do
+  lint_count=$((lint_count + 1))
+  # Find all files with this slug (match whole first field)
+  matching=$(awk -F'\t' -v s="$dup_slug" '$1==s{printf "%s ", $2}' "$_slug_tmp")
+  warn "DUPLICATE SLUG '$dup_slug': $matching"
+done < <(cut -f1 "$_slug_tmp" | sort | uniq -d)
+
+rm -f "$_slug_tmp"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 

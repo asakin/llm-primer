@@ -264,8 +264,11 @@ echo "---" > "$VAULT/1-Projects/myproject/overview.md"
 echo "---" > "$VAULT/stray-dir/orphan.md"
 echo "---" > "$VAULT/random-note.md"
 
-# File without frontmatter (lint issue)
+# File without frontmatter in a content dir (should be flagged by lint)
 echo "# No frontmatter here" > "$VAULT/1-Projects/myproject/no-frontmatter.md"
+
+# File without frontmatter in _inbox/ (should NOT be flagged — raw captures are OK)
+echo "Some raw captured note" > "$VAULT/_inbox/2026-04-14-raw-capture.md"
 
 # Duplicate slug
 echo "---" > "$VAULT/1-Projects/myproject/2026-04-01-topic.md"
@@ -293,6 +296,10 @@ inbox_count=$(ls "$VAULT/_inbox/" | wc -l | tr -d ' ')
 output=$("$PRIMER_GC" --vault "$VAULT" --lint 2>&1) || true
 assert_contains "gc: lint flags missing frontmatter" "NO FRONTMATTER" "$output"
 assert_contains "gc: lint flags duplicate slugs" "DUPLICATE SLUG" "$output"
+
+# Files in _inbox/ should NOT be flagged for missing frontmatter
+[[ "$output" != *"raw-capture"* ]] && _pass "gc: _inbox files skipped by lint" || \
+  _fail "gc: _inbox file incorrectly flagged for missing frontmatter"
 
 # Known root files should never be flagged
 [[ "$output" != *"README.md"* ]] && _pass "gc: README.md not flagged as stray" || \
