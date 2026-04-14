@@ -248,17 +248,61 @@ Both require primerd to already be running. The launchd agent handles that autom
 
 ## Garbage collector
 
-`primer-gc` finds `.md` files that drifted into the wrong place in your vault and moves them to `_inbox/` so they get filed properly.
+`primer-gc` finds `.md` files that drifted into the wrong place in your vault and moves them to your inbox so they get filed properly.
 
 Drift enters a wiki from two directions: AI output (fix with better instructions) and casual human drops (fix with a background worker). The GC is that worker.
 
 ```bash
 primer gc ~/path/to/vault           # dry run — show what would move
-primer gc ~/path/to/vault --auto    # move stray files to _inbox/
+primer gc ~/path/to/vault --auto    # move stray files to your inbox
 primer gc ~/path/to/vault --lint    # flag frontmatter issues + duplicate slugs only
 ```
 
-**What's stray:** any `.md` file not in a `_*` directory, not in a named content directory (`0-Ideas/`, `1-Projects/`, etc.), and not a known root-level file (`README.md`, `CLAUDE.md`, etc.).
+### What's stray (and how you change that)
+
+A `.md` file is "stray" if it isn't in a `_*` directory, isn't in a named content directory, and isn't a recognized root-level file. The specifics — which directories count, which root files are recognized, where strays get moved — are governed by a **vault-scoped policy file** at `<vault>/.primer-gc`.
+
+If no policy file exists, defaults kick in that are shaped like [llm-context-base](https://github.com/asakin/llm-context-base) vaults (`0-Ideas/`, `1-Projects/`, `2-Knowledge/`, etc.; filenames like `YYYY-MM-DD-slug.md`; strays moved to `_inbox/`). If that doesn't match your setup, override it.
+
+### The `.primer-gc` policy file
+
+Plain `KEY=value`, one per line, comments with `#`. Drop it at your vault root. Every field is optional — what you don't set falls back to the built-in default.
+
+```ini
+# <vault>/.primer-gc
+#
+# Directories where .md files are allowed (comma-separated)
+ALLOWED_DIRS=notes,projects,references,archive
+
+# Root-level files allowed as-is
+ALLOWED_ROOT_FILES=README.md,INDEX.md
+
+# Where strays get moved (relative to vault root)
+INBOX_DIR=incoming
+
+# Regex that filenames must match. Leave empty to skip the naming lint.
+FILENAME_REGEX=
+
+# Dirs where frontmatter is not required (raw capture zones)
+LINT_SKIP_DIRS=incoming,scratch
+```
+
+### Let your LLM maintain it
+
+The whole point of an LLM wiki is that the LLM knows your conventions. The `.primer-gc` file exists so the LLM can *tell the GC about those conventions* instead of forcing the GC to guess.
+
+Add this to your `CLAUDE.md` (or equivalent):
+
+```markdown
+The GC policy for this vault is at `.primer-gc` (plain KEY=value).
+When we add a new top-level content directory, update ALLOWED_DIRS.
+When we introduce a new root-level convention file, update ALLOWED_ROOT_FILES.
+When the filename convention changes, update FILENAME_REGEX.
+```
+
+Now when you tell your LLM "let's add a `6-Recipes/` directory for cooking content," it can update the policy at the same time. The GC learns without you editing a config file.
+
+### Other pieces
 
 **Never moved:** files in `_*` directories, assets (`.png`, `.pdf`, `.sh`, etc.), symlinks.
 
@@ -272,7 +316,19 @@ PRIMER_GC_VAULT=~/path/to/your/wiki
 PRIMER_GC_INTERVAL=3600
 ```
 
-primerd runs primer-gc in the background. Moved files appear in your `_inbox/` on the next triage.
+primerd runs primer-gc in the background. Moved files appear in your inbox on the next triage.
+
+### What's coming (v0.6.0 direction — not shipped)
+
+Static rules handle the 95% of cases that look obvious. The remaining 5% — "this file doesn't match any rule, but is it actually misplaced?" — deserves an LLM's judgment, not a heuristic.
+
+The planned v0.6.0 architecture:
+- Static rules run hot (hourly, no LLM call)
+- Ambiguous files go to an "LLM review queue"
+- A background worker drains the queue by asking a **warm idle session** (configurable — `use_slot: alt`) to make the call. The LLM already has your wiki's context loaded; no separate session needed
+- Decisions get applied as moves
+
+Track progress in RELEASE.md and the project issues.
 
 ---
 
