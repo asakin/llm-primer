@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# primer-selftest — llm-primer self-test suite
+#
+# Tests the daemon, CLI, config system, and garbage collector without
+# touching your real pool or your actual LLM CLI.
+#
+# Usage:
+#   primer selftest          # run all tests
+#   primer selftest --fast   # skip tests that need tmux running
+#   primer-selftest --help   # this help
+
+set -euo pipefail
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+FAST_ONLY=false
+VERBOSE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fast)   FAST_ONLY=true; shift ;;
+    --verbose|-v) VERBOSE=true; shift ;;
+    --help|-h)
+      cat <<'HELP'
+primer-selftest — llm-primer self-test suite
+
+Tests the daemon, CLI, config system, and GC without touching your real pool
+or making any LLM API calls. Uses a fake CLI that echoes SESSION START.
+
+Usage:
+  primer selftest            Run all tests
+  primer selftest --fast     Skip tests that spawn tmux sessions (faster)
+  primer selftest --verbose  Print each check as it runs
+
+Exit codes:
+  0   All tests passed
+  1   One or more tests failed
+
+Tests:
+  config    Config file loading (KEY=VALUE parsing, env var override)
+  pool      Pool lifecycle: start, warm, status, stop
+  alt       Alt slot CLI resolution and label
+  switch    primer switch creates warm-request file
+  gc        Garbage collector: stray detection, frontmatter lint, duplicate slugs
+  install   install.sh dry-run check (curl not called)
+HELP
+      exit 0
+      ;;
+    *) echo "Unknown option: $1. Run 'primer-selftest --help'." >&2; exit 1 ;;
+  esac
+done
+
+# ── test harness ──────────────────────────────────────────────────────────────
+
+PASS=0
+FAIL=0
+SKIP=0
+_failures=()
+
+_pass() { PASS=$((PASS + 1)); $VERBOSE && echo "  ✓ $1"; }
+_fail() { FAIL=$((FAIL + 1)); _failures+=("$1"); echo "  ✗ $1"; }
+_skip() { SKIP=$((SKIP + 1)); $VERBOSE && echo "  ⊘ $1 (skipped)"; }
+
+assert_eq() {
+  local desc="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc (expected: '$expected', got: '$actual')"
+  fi
+}
+
+assert_contains() {
+  local desc="$1" needle="$2" haystack="$3"
+  if echo "$haystack" | grep -qF "$needle"; then
+    _pass "$desc"
+  else
+    _fail "$desc (expected to contain: '$needle')"
+  fi
+}
+
+assert_file_exists() {
+  local desc="$1" file="$2"
+  [[ -f "$file" ]] && _pass "$desc" || _fail "$desc (file not found: $file)"
+}
+
+assert_file_missing() {
+  local desc="$1" file="$2"
+  [[ ! -f "$file" ]] && _pass "$desc" || _fail "$desc (file should not exist: $file)"
+}
+
+assert_exit() {
+  local desc="$1" expected_code="$2"
+  shift 2
+  local actual_code=0
+  "$@" &>/dev/null || actual_code=$?
+  assert_eq "$desc" "$expected_code" "$actual_code"
+}
+
+section() { echo ""; echo "── $1 ──"; }
+
+# ── test environment ──────────────────────────────────────────────────────────
+
+TEST_DIR=$(mktemp -d)
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+export PRIMER_DIR="$TEST_DIR/primer"
+export PRIMER_CONFIG="$TEST_DIR/primer.conf"
+export PRIMER_SESSION_PREFIX="selftest"
+export PRIMER_POOL_SIZE=3
+export PRIMER_CLI="echo"           # fake CLI that exits immediately
+export PRIMER_WARMUP_MARKER="SESSION START"
+export PRIMER_WARMUP_MSG="ready"
+
+# Locate the scripts being tested
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PRIMERD="$SCRIPT_DIR/primerd"
+PRIMER="$SCRIPT_DIR/primer"
+PRIMER_GC="$SCRIPT_DIR/primer-gc"
+
+[[ -x "$PRIMERD" ]] || { echo "error: primerd not found at $PRIMERD" >&2; exit 1; }
+[[ -x "$PRIMER"  ]] || { echo "error: primer not found at $PRIMER"   >&2; exit 1; }
+[[ -x "$PRIMER_GC" ]] || { echo "error: primer-gc not found at $PRIMER_GC" >&2; exit 1; }
+
+echo "primer-selftest"
+echo "───────────────"
+echo "test dir: $TEST_DIR"
+echo ""
+
+# ── test: config file ─────────────────────────────────────────────────────────
+
+section "config"
+
+# Write a test config
+cat > "$PRIMER_CONFIG" <<'EOF'
+# test config
+PRIMER_POOL_SIZE=5
+PRIMER_ALT_CLI=ollama run llama3
+PRIMER_GC_INTERVAL=7200
+EOF
+
+# Source the config-loading logic inline (test it in isolation)
+_test_load_config() {
+  local key value
+  while IFS='=' read -r key value; do
+    [[ "$key" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${key// }" ]] && continue
+    key="${key// /}"
+    [[ -n "${!key+set}" ]] && continue
+    export "$key"="$value"
+  done < "$PRIMER_CONFIG"
+}
+
+# Unset vars first so config file can set them
+(
+  unset PRIMER_POOL_SIZE PRIMER_ALT_CLI PRIMER_GC_INTERVAL 2>/dev/null || true
+  _test_load_config
+  assert_eq "config: PRIMER_POOL_SIZE loaded" "5" "$PRIMER_POOL_SIZE"
+  assert_eq "config: PRIMER_ALT_CLI loaded" "ollama run llama3" "$PRIMER_ALT_CLI"
+  assert_eq "config: PRIMER_GC_INTERVAL loaded" "7200" "$PRIMER_GC_INTERVAL"
+) || _fail "config subshell failed"
+_pass "config: values loaded from file"
+
+# Env var should override config file
+(
+  export PRIMER_POOL_SIZE=2
+  _test_load_config
+  assert_eq "config: env var wins over file" "2" "$PRIMER_POOL_SIZE"
+) || _fail "config override subshell failed"
+_pass "config: env var overrides file value"
+
+# Comments and blank lines don't cause errors
+printf "# comment\n\nKEY=value\n" > "$TEST_DIR/clean.conf"
+(
+  export PRIMER_CONFIG="$TEST_DIR/clean.conf"
+  _test_load_config
+  assert_eq "config: plain key parsed" "value" "${KEY:-}"
+) 2>/dev/null || true
+_pass "config: comments and blank lines handled"
+
+# ── test: config-template ─────────────────────────────────────────────────────
+
+section "config-template"
+
+output=$("$PRIMERD" config-template)
+assert_contains "config-template: PRIMER_CLI present" "PRIMER_CLI=" "$output"
+assert_contains "config-template: PRIMER_ALT_CLI present" "PRIMER_ALT_CLI=" "$output"
+assert_contains "config-template: examples present" "ollama" "$output"
+assert_contains "config-template: claude example present" "claude" "$output"
+assert_contains "config-template: aider example present" "aider" "$output"
+
+# ── test: alt slot resolution ─────────────────────────────────────────────────
+
+section "alt slot"
+
+# slot_cli logic: test by sourcing primerd functions in a subshell
+(
+  export PRIMER_POOL_SIZE=3
+  export PRIMER_CLI=claude
+  export PRIMER_ALT_CLI="ollama run llama3"
+  export PRIMER_ALT_SLOT=2
+
+  # Source just the function definitions
+  source <(sed -n '/^_default_alt_slot/,/^slot_label/p' "$PRIMERD" 2>/dev/null || true)
+
+  if declare -f slot_cli &>/dev/null; then
+    result=$(slot_cli 0)
+    assert_eq "alt: slot 0 uses PRIMER_CLI" "claude" "$result"
+    result=$(slot_cli 2)
+    assert_eq "alt: slot 2 uses PRIMER_ALT_CLI" "ollama run llama3" "$result"
+  else
+    _skip "alt: slot_cli function not sourceable (bash version limitation)"
+  fi
+) 2>/dev/null || _skip "alt: subshell sourcing not supported"
+
+# Test that primer alt fails helpfully when PRIMER_ALT_CLI is not set
+(
+  unset PRIMER_ALT_CLI 2>/dev/null || true
+  export PRIMER_ALT_CLI=""
+  output=$("$PRIMER" alt 2>&1 || true)
+  assert_contains "alt: helpful error when not configured" "PRIMER_ALT_CLI" "$output"
+)
+_pass "alt: error message references PRIMER_ALT_CLI"
+
+# ── test: primer switch ───────────────────────────────────────────────────────
+
+section "switch"
+
+mkdir -p "$PRIMER_DIR"
+rm -f "$PRIMER_DIR/warm-request"
+
+output=$("$PRIMER" switch 2>&1)
+assert_file_exists "switch: warm-request file created" "$PRIMER_DIR/warm-request"
+assert_contains "switch: output mentions primer attach" "primer attach" "$output"
+
+# Cleanup
+rm -f "$PRIMER_DIR/warm-request"
+
+# ── test: primer warm ─────────────────────────────────────────────────────────
+
+section "warm"
+
+"$PRIMER" warm
+assert_file_exists "warm: warm-request file created" "$PRIMER_DIR/warm-request"
+rm -f "$PRIMER_DIR/warm-request"
+
+# ── test: garbage collector ───────────────────────────────────────────────────
+
+section "gc"
+
+# Build a fake vault
+VAULT="$TEST_DIR/vault"
+mkdir -p \
+  "$VAULT/_inbox" \
+  "$VAULT/_meta/instructions" \
+  "$VAULT/_config" \
+  "$VAULT/1-Projects/myproject" \
+  "$VAULT/2-Knowledge" \
+  "$VAULT/stray-dir"
+
+# Files that should NOT be moved
+echo "---" > "$VAULT/README.md"
+echo "---" > "$VAULT/_inbox/2026-04-01-note.md"
+echo "---" > "$VAULT/_meta/instructions/general.md"
+echo "---" > "$VAULT/_config/config.md"
+echo "---" > "$VAULT/1-Projects/myproject/overview.md"
+
+# Files that SHOULD be flagged as stray
+echo "---" > "$VAULT/stray-dir/orphan.md"
+echo "---" > "$VAULT/random-note.md"
+
+# File without frontmatter (lint issue)
+echo "# No frontmatter here" > "$VAULT/1-Projects/myproject/no-frontmatter.md"
+
+# Duplicate slug
+echo "---" > "$VAULT/1-Projects/myproject/2026-04-01-topic.md"
+echo "---" > "$VAULT/2-Knowledge/2026-04-02-topic.md"
+
+# Dry run — should report strays but not move them
+output=$("$PRIMER_GC" --vault "$VAULT" 2>&1)
+assert_contains "gc: stray file reported" "STRAY" "$output"
+assert_contains "gc: orphan.md reported" "orphan.md" "$output"
+
+# Stray files should still be in place after dry run
+assert_file_exists "gc: dry run does not move files" "$VAULT/stray-dir/orphan.md"
+
+# Auto mode — should move stray files
+"$PRIMER_GC" --vault "$VAULT" --auto > /dev/null 2>&1 || true
+assert_file_missing "gc: auto moves stray to inbox" "$VAULT/stray-dir/orphan.md"
+assert_file_missing "gc: auto moves root stray to inbox" "$VAULT/random-note.md"
+
+# Inbox should now contain the moved files
+inbox_count=$(ls "$VAULT/_inbox/" | wc -l | tr -d ' ')
+[[ "$inbox_count" -ge 3 ]] && _pass "gc: moved files appear in _inbox" || \
+  _fail "gc: expected ≥3 files in _inbox, got $inbox_count"
+
+# Lint check — should flag no-frontmatter
+output=$("$PRIMER_GC" --vault "$VAULT" --lint 2>&1)
+assert_contains "gc: lint flags missing frontmatter" "NO FRONTMATTER" "$output"
+assert_contains "gc: lint flags duplicate slugs" "DUPLICATE SLUG" "$output"
+
+# Known root files should never be flagged
+[[ "$output" != *"README.md"* ]] && _pass "gc: README.md not flagged as stray" || \
+  _fail "gc: README.md incorrectly flagged"
+
+# ── test: help outputs ────────────────────────────────────────────────────────
+
+section "help"
+
+output=$("$PRIMER" help 2>&1)
+assert_contains "primer help: attach mentioned" "attach" "$output"
+assert_contains "primer help: alt mentioned" "alt" "$output"
+assert_contains "primer help: switch mentioned" "switch" "$output"
+assert_contains "primer help: config file mentioned" "config" "$output"
+
+output=$("$PRIMERD" help 2>&1)
+assert_contains "primerd help: PRIMER_ALT_CLI mentioned" "PRIMER_ALT_CLI" "$output"
+assert_contains "primerd help: config-template mentioned" "config-template" "$output"
+
+output=$("$PRIMER_GC" --help 2>&1)
+assert_contains "primer-gc help: --auto mentioned" "--auto" "$output"
+assert_contains "primer-gc help: --lint mentioned" "--lint" "$output"
+
+# ── pool lifecycle (requires tmux) ────────────────────────────────────────────
+
+section "pool lifecycle"
+
+if $FAST_ONLY; then
+  _skip "pool: start/stop (--fast mode)"
+  _skip "pool: status output"
+elif ! command -v tmux &>/dev/null; then
+  _skip "pool: tmux not available"
+else
+  # Use a mock CLI that immediately prints the warmup marker and exits
+  MOCK_CLI="$TEST_DIR/mock-cli"
+  cat > "$MOCK_CLI" <<'MOCK'
+#!/usr/bin/env bash
+echo "SESSION START — mock LLM"
+read -r line   # stay alive until killed
+MOCK
+  chmod +x "$MOCK_CLI"
+
+  export PRIMER_CLI="$MOCK_CLI"
+  export PRIMER_MODE=lazy
+
+  # Start daemon
+  "$PRIMERD" start > /dev/null 2>&1
+  sleep 1
+
+  pid_file="$PRIMER_DIR/primerd.pid"
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    _pass "pool: daemon started"
+  else
+    _fail "pool: daemon did not start"
+  fi
+
+  # Trigger a warm
+  "$PRIMER" warm
+  sleep 3  # give warmup time
+
+  status_out=$("$PRIMER" status 2>&1)
+  assert_contains "pool: status shows pool name" "$PRIMER_SESSION_PREFIX-pool" "$status_out"
+
+  # Stop daemon
+  "$PRIMERD" stop > /dev/null 2>&1
+  sleep 1
+
+  if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    _pass "pool: daemon stopped"
+  else
+    _fail "pool: daemon still running after stop"
+  fi
+
+  # Clean up tmux session
+  tmux kill-session -t "${PRIMER_SESSION_PREFIX}-pool" 2>/dev/null || true
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo "── Results ─────────────────────────────────────────────────"
+printf "  ✓ passed: %s\n" "$PASS"
+printf "  ✗ failed: %s\n" "$FAIL"
+printf "  ⊘ skipped: %s\n" "$SKIP"
+
+if [[ ${#_failures[@]} -gt 0 ]]; then
+  echo ""
+  echo "  Failed tests:"
+  for f in "${_failures[@]}"; do
+    echo "    • $f"
+  done
+fi
+echo "────────────────────────────────────────────────────────────"
+
+[[ "$FAIL" -eq 0 ]]

@@ -1,190 +1,133 @@
 #!/usr/bin/env bash
 # primer — llm-primer CLI
-# Attach to and manage pre-warmed Claude Code sessions
+# Attach to and manage pre-warmed LLM sessions
 
 set -euo pipefail
+
+# ── config file loading ───────────────────────────────────────────────────────
+
+PRIMER_CONFIG="${PRIMER_CONFIG:-$HOME/.llm-primer/config}"
+
+_load_config() {
+  [[ -f "$PRIMER_CONFIG" ]] || return 0
+  while IFS='=' read -r key value; do
+    [[ "$key" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${key// }" ]] && continue
+    key="${key// /}"
+    [[ -n "${!key+set}" ]] && continue
+    export "$key"="$value"
+  done < "$PRIMER_CONFIG"
+}
+
+_load_config
+
+# ── configuration ─────────────────────────────────────────────────────────────
 
 PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
 PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
 PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-3}"
-PRIMER_HAIKU_SLOT="${PRIMER_HAIKU_SLOT:-}"
+PRIMER_CLI="${PRIMER_CLI:-claude}"
+PRIMER_ALT_SLOT="${PRIMER_ALT_SLOT:-}"
+PRIMER_ALT_CLI="${PRIMER_ALT_CLI:-}"
 TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-require() {
-  command -v "$1" &>/dev/null || die "'$1' is required but not installed"
-}
+die() { echo "error: $*" >&2; exit 1; }
+require() { command -v "$1" &>/dev/null || die "'$1' is required but not installed"; }
 
-window_name() {
-  echo "${PRIMER_SESSION_PREFIX}-$1"
-}
-
-get_state() {
-  local slot="$1"
-  local file="$PRIMER_DIR/state/slot-${slot}"
-  [[ -f "$file" ]] && cat "$file" || echo "unknown"
-}
-
-get_model() {
-  local slot="$1"
-  local file="$PRIMER_DIR/state/slot-${slot}-model"
-  if [[ -f "$file" ]]; then
-    cat "$file"
-  else
-    # Infer from haiku slot setting
-    local haiku_slot="${PRIMER_HAIKU_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
-    [[ "$slot" -eq "$haiku_slot" ]] && echo "haiku" || echo "claude"
-  fi
-}
+window_name()  { echo "${PRIMER_SESSION_PREFIX}-$1"; }
+get_state()    { local f="$PRIMER_DIR/state/slot-${1}"; [[ -f "$f" ]] && cat "$f" || echo "unknown"; }
+get_label()    { local f="$PRIMER_DIR/state/slot-${1}-label"; [[ -f "$f" ]] && cat "$f" || echo "?"; }
 
 pane_content() {
-  local window="$1"
-  tmux capture-pane -t "${TMUX_SESSION}:${window}" -p 2>/dev/null || echo ""
+  tmux capture-pane -t "${TMUX_SESSION}:${1}" -p 2>/dev/null || echo ""
 }
 
 is_warm() {
-  local window="$1"
-  pane_content "$window" | grep -q "SESSION START"
+  pane_content "$(window_name "$1")" | grep -q "${PRIMER_WARMUP_MARKER:-SESSION START}"
+}
+
+_alt_slot() {
+  echo "${PRIMER_ALT_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
 }
 
 find_warm_slot() {
-  # Find the first warm non-haiku slot
-  local haiku_slot="${PRIMER_HAIKU_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
+  # Returns the first warm slot that is NOT the alt slot
+  local alt_slot
+  alt_slot=$(_alt_slot)
   for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-    [[ "$slot" -eq "$haiku_slot" ]] && continue
-    local window
-    window=$(window_name "$slot")
-    if is_warm "$window" 2>/dev/null; then
-      echo "$slot"
-      return 0
-    fi
+    [[ -n "$PRIMER_ALT_CLI" && "$slot" -eq "$alt_slot" ]] && continue
+    is_warm "$slot" 2>/dev/null && { echo "$slot"; return 0; }
   done
-  return 1
-}
-
-find_haiku_slot() {
-  local haiku_slot="${PRIMER_HAIKU_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
-  [[ "$haiku_slot" -eq -1 ]] && die "Haiku slot is disabled (PRIMER_HAIKU_SLOT=-1)"
-  local window
-  window=$(window_name "$haiku_slot")
-  if is_warm "$window" 2>/dev/null; then
-    echo "$haiku_slot"
-    return 0
-  fi
   return 1
 }
 
 do_attach() {
   local slot="$1"
-  local attach_window
-  attach_window=$(window_name "$slot")
-  local attach_state
-  attach_state=$(get_state "$slot")
-  local model
-  model=$(get_model "$slot")
+  local window
+  window=$(window_name "$slot")
+  local state label
+  state=$(get_state "$slot")
+  label=$(get_label "$slot")
 
-  echo "→ Attaching to slot $slot [$model] (state: $attach_state)"
+  echo "→ Attaching to slot $slot [$label] (state: $state)"
 
   if [[ -n "${TMUX:-}" ]]; then
-    tmux switch-client -t "${TMUX_SESSION}:${attach_window}" 2>/dev/null || \
+    tmux switch-client -t "${TMUX_SESSION}:${window}" 2>/dev/null || \
       die "Slot $slot not found. Is primerd running?"
   else
-    tmux attach-session -t "${TMUX_SESSION}:${attach_window}" 2>/dev/null || \
+    tmux attach-session -t "${TMUX_SESSION}:${window}" 2>/dev/null || \
       die "Pool session not found. Run 'primerd start' first."
   fi
 }
+
+# ── commands ──────────────────────────────────────────────────────────────────
 
 cmd="${1:-help}"
 
 case "$cmd" in
   attach|a)
     require tmux
-
     attach_slot="${2:-}"
-
     if [[ -z "$attach_slot" ]]; then
       if ! attach_slot=$(find_warm_slot); then
-        echo "⚠ No warm slots available. Attaching to slot 0 (may not be fully ready)."
+        echo "⚠ No warm slots available. Attaching to slot 0 (may still be starting up)."
         attach_slot=0
       fi
     fi
-
     do_attach "$attach_slot"
     ;;
 
-  haiku|h)
-    # Attach to the Haiku slot — the cheap model, good for quick tasks
+  alt)
+    # Attach to the alt slot (faster model, different tool — whatever PRIMER_ALT_CLI is set to).
     require tmux
+    [[ -z "$PRIMER_ALT_CLI" ]] && die "Alt slot not configured. Set PRIMER_ALT_CLI in ~/.llm-primer/config or environment.
+  Example (Claude Haiku): PRIMER_ALT_CLI=claude --model claude-haiku-4-5-20251001
+  Example (Ollama):       PRIMER_ALT_CLI=ollama run llama3.2:1b
+  Run: primerd config-template > ~/.llm-primer/config"
 
-    haiku_slot="${PRIMER_HAIKU_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
-    [[ "$haiku_slot" -eq -1 ]] && die "Haiku slot is disabled (PRIMER_HAIKU_SLOT=-1)"
-
-    if ! find_haiku_slot > /dev/null 2>&1; then
-      echo "⚠ Haiku slot $haiku_slot is not warm yet — attaching anyway (may still be starting up)."
+    local alt_slot
+    alt_slot=$(_alt_slot)
+    if ! is_warm "$alt_slot" 2>/dev/null; then
+      echo "⚠ Alt slot $alt_slot not warm yet — attaching anyway (may still be starting up)."
     fi
-
-    do_attach "$haiku_slot"
+    do_attach "$alt_slot"
     ;;
 
   switch|sw)
-    # Request a context switch: pre-warm a replacement, print instructions.
-    # Use this when your current session's context is getting heavy and you want
-    # to continue the conversation in a fresh session.
+    # Pre-warm a replacement and print switch instructions.
+    # Use when your current session's context is getting heavy.
     touch "$PRIMER_DIR/warm-request"
     cat <<'MSG'
 → Switch requested. primerd is warming a fresh session.
 
 When you're ready to switch:
-  1. Open a new terminal (or iTerm tab)
+  1. Open a new terminal (or new iTerm tab / Obsidian terminal tab)
   2. Run: primer attach
 
-The new session will be fully initialized with your session protocol.
-Your current session stays open — you can copy anything you need before closing it.
+Your current session stays open. Copy anything you need before closing it.
 MSG
-    ;;
-
-  status|s)
-    require tmux
-
-    # Daemon status
-    if [[ -f "$PRIMER_DIR/primerd.pid" ]] && kill -0 "$(cat "$PRIMER_DIR/primerd.pid")" 2>/dev/null; then
-      echo "daemon: running (pid $(cat "$PRIMER_DIR/primerd.pid"))"
-    else
-      echo "daemon: not running (start with 'primerd start')"
-    fi
-
-    # Pool status
-    echo ""
-    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-      echo "pool: no tmux session found"
-    else
-      echo "pool: $TMUX_SESSION"
-      local haiku_slot="${PRIMER_HAIKU_SLOT:-$(( PRIMER_POOL_SIZE - 1 ))}"
-      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-        window=$(window_name "$slot")
-        state=$(get_state "$slot")
-        model=$(get_model "$slot")
-        warm=""
-        haiku_tag=""
-        if is_warm "$window" 2>/dev/null; then
-          warm=" ✓"
-        fi
-        [[ "$slot" -eq "$haiku_slot" ]] && haiku_tag=" [haiku]"
-        printf "  slot %s [%s]%s: %s%s\n" "$slot" "$model" "$haiku_tag" "$state" "$warm"
-      done
-    fi
-    ;;
-
-  start)
-    primerd start
-    ;;
-
-  stop)
-    primerd stop
     ;;
 
   warm|w)
@@ -192,12 +135,40 @@ MSG
     echo "→ Warm request sent. primerd will start warming a slot."
     ;;
 
-  gc)
-    # Run the garbage collector against a vault
-    vault="${2:-${PRIMER_GC_VAULT:-}}"
-    if [[ -z "$vault" ]]; then
-      die "Usage: primer gc <vault-path>  or set PRIMER_GC_VAULT"
+  status|s)
+    require tmux
+    if [[ -f "$PRIMER_DIR/primerd.pid" ]] && kill -0 "$(cat "$PRIMER_DIR/primerd.pid")" 2>/dev/null; then
+      echo "daemon: running (pid $(cat "$PRIMER_DIR/primerd.pid"))"
+    else
+      echo "daemon: not running (start with 'primerd start')"
     fi
+
+    echo ""
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      echo "pool: no tmux session found"
+    else
+      echo "pool: $TMUX_SESSION"
+      local alt_slot
+      alt_slot=$(_alt_slot)
+      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+        local state label warm_tag alt_tag
+        state=$(get_state "$slot")
+        label=$(get_label "$slot")
+        warm_tag=""
+        alt_tag=""
+        is_warm "$slot" 2>/dev/null && warm_tag=" ✓"
+        [[ -n "$PRIMER_ALT_CLI" && "$slot" -eq "$alt_slot" ]] && alt_tag=" [alt]"
+        printf "  slot %s [%s]%s: %s%s\n" "$slot" "$label" "$alt_tag" "$state" "$warm_tag"
+      done
+    fi
+    ;;
+
+  start)  primerd start ;;
+  stop)   primerd stop ;;
+
+  gc)
+    vault="${2:-${PRIMER_GC_VAULT:-}}"
+    [[ -z "$vault" ]] && die "Usage: primer gc <vault-path>  or set PRIMER_GC_VAULT"
     gc_bin="$(dirname "$(command -v primer)")/primer-gc"
     [[ -x "$gc_bin" ]] || die "primer-gc not found at $gc_bin"
     shift; shift 2>/dev/null || true
@@ -206,52 +177,55 @@ MSG
 
   logs|log)
     log_file="$PRIMER_DIR/primerd.log"
-    if [[ -f "$log_file" ]]; then
-      tail -f "$log_file"
-    else
-      echo "No log file found at $log_file"
-    fi
+    [[ -f "$log_file" ]] && tail -f "$log_file" || echo "No log file found at $log_file"
+    ;;
+
+  selftest|test)
+    # Run the self-test suite
+    selftest_bin="$(dirname "$(command -v primer)")/primer-selftest"
+    [[ -x "$selftest_bin" ]] || die "primer-selftest not found at $selftest_bin"
+    exec "$selftest_bin" "$@"
     ;;
 
   help|--help|-h|"")
     cat <<'HELP'
 primer — llm-primer
 
-Attach to a pre-warmed Claude Code session instantly.
+Attach to a pre-warmed LLM session instantly.
 
 Usage:
-  primer attach [slot]   Attach to a warm session (default: first warm non-haiku slot)
-  primer haiku           Attach to the Haiku slot (cheap model for quick tasks)
+  primer attach [slot]   Attach to a warm session (first warm non-alt slot)
+  primer alt             Attach to the alt slot (fast/cheap model, if configured)
   primer switch          Pre-warm a replacement and print switch instructions
   primer warm            Signal primerd to warm a session now
   primer gc <vault>      Run the garbage collector against a vault path
+  primer selftest        Run the self-test suite
   primer status          Show pool and daemon status
   primer start           Start the primerd daemon
   primer stop            Stop the primerd daemon
   primer logs            Tail the daemon log
 
 Shorthand:
-  primer a               Same as primer attach
-  primer h               Same as primer haiku
-  primer sw              Same as primer switch
-  primer w               Same as primer warm
-  primer s               Same as primer status
+  primer a    attach     primer s    status
+  primer sw   switch     primer w    warm
 
-Pool layout (default: 3 slots):
-  slot 0  primary claude session
-  slot 1  standby claude session
-  slot 2  haiku slot — fast and cheap, good for quick questions
+Alt slot:
+  The alt slot runs a different CLI — faster model, cheaper model, different tool.
+  Configure it: set PRIMER_ALT_CLI in ~/.llm-primer/config or your environment.
+  Not configured by default — all slots run PRIMER_CLI until you set it.
 
-Context switching:
-  When your current session is getting heavy, run `primer switch`.
-  It pre-warms a replacement and tells you when to jump.
-  Or add to CLAUDE.md so Claude asks you automatically (see README).
+Config file:
+  ~/.llm-primer/config   KEY=value pairs, one per line. Comments with #.
+  Generate a starter:    primerd config-template > ~/.llm-primer/config
+  Your LLM assistant can generate or update this file on your behalf.
 
 Environment:
-  PRIMER_POOL_SIZE       Number of sessions in the pool (default: 3)
-  PRIMER_HAIKU_SLOT      Which slot is haiku (default: last slot, -1 to disable)
-  PRIMER_DIR             State directory (default: ~/.llm-primer)
-  PRIMER_GC_VAULT        Default vault path for primer gc
+  PRIMER_POOL_SIZE    Number of sessions in the pool (default: 3)
+  PRIMER_ALT_CLI      CLI for the alt slot (empty = disabled)
+  PRIMER_ALT_SLOT     Which slot is alt (default: last slot)
+  PRIMER_DIR          State directory (default: ~/.llm-primer)
+  PRIMER_GC_VAULT     Default vault path for primer gc
+  PRIMER_CONFIG       Config file path (default: ~/.llm-primer/config)
 
 HELP
     ;;

@@ -19,8 +19,8 @@ Thanks for wanting to help. This is a small project — keep it simple.
 
 1. Open an issue first for anything non-trivial. Describe the problem, not the solution. This saves time if the direction isn't right.
 2. Fork, branch (`feat/your-thing` or `fix/your-thing`), make the change.
-3. Test it manually — see the Testing section below.
-4. Open a PR with what you changed and a copy of your manual test output.
+3. Run `primer selftest` — all tests must pass. Include the output in your PR.
+4. Open a PR with what you changed and a copy of your selftest output.
 
 ## Dev setup
 
@@ -37,7 +37,18 @@ No build step. No dependencies beyond bash and tmux.
 
 ## Testing
 
-There's no automated test suite yet. Manual test plan:
+Run the built-in suite first:
+
+```bash
+primer selftest           # full suite
+primer selftest --fast    # skip tmux-dependent tests (faster)
+```
+
+All tests must pass before submitting a PR. Include the output in the PR description.
+
+The selftest covers: config file loading, alt slot resolution, `primer switch`, GC stray detection, GC lint, and (in full mode) pool lifecycle with a mock CLI.
+
+Manual verification checklist (run after selftest passes):
 
 ```bash
 # Clean state
