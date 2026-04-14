@@ -57,9 +57,9 @@ FAIL=0
 SKIP=0
 _failures=()
 
-_pass() { PASS=$((PASS + 1)); $VERBOSE && echo "  ✓ $1"; }
-_fail() { FAIL=$((FAIL + 1)); _failures+=("$1"); echo "  ✗ $1"; }
-_skip() { SKIP=$((SKIP + 1)); $VERBOSE && echo "  ⊘ $1 (skipped)"; }
+_pass() { PASS=$((PASS + 1)); $VERBOSE && echo "  ✓ $1"; return 0; }
+_fail() { FAIL=$((FAIL + 1)); _failures+=("$1"); echo "  ✗ $1"; return 1; }
+_skip() { SKIP=$((SKIP + 1)); $VERBOSE && echo "  ⊘ $1 (skipped)"; return 0; }
 
 assert_eq() {
   local desc="$1" expected="$2" actual="$3"
@@ -72,7 +72,7 @@ assert_eq() {
 
 assert_contains() {
   local desc="$1" needle="$2" haystack="$3"
-  if echo "$haystack" | grep -qF "$needle"; then
+  if [[ "$haystack" == *"$needle"* ]]; then
     _pass "$desc"
   else
     _fail "$desc (expected to contain: '$needle')"
@@ -151,32 +151,29 @@ _test_load_config() {
   done < "$PRIMER_CONFIG"
 }
 
-# Unset vars first so config file can set them
+# Note: assertions inside subshells now propagate failures (_fail returns 1).
+# The subshell's last exit code determines if the outer || _fail fires.
+
 (
   unset PRIMER_POOL_SIZE PRIMER_ALT_CLI PRIMER_GC_INTERVAL 2>/dev/null || true
   _test_load_config
-  assert_eq "config: PRIMER_POOL_SIZE loaded" "5" "$PRIMER_POOL_SIZE"
-  assert_eq "config: PRIMER_ALT_CLI loaded" "ollama run llama3" "$PRIMER_ALT_CLI"
-  assert_eq "config: PRIMER_GC_INTERVAL loaded" "7200" "$PRIMER_GC_INTERVAL"
-) || _fail "config subshell failed"
-_pass "config: values loaded from file"
+  assert_eq "config: PRIMER_POOL_SIZE loaded" "5" "$PRIMER_POOL_SIZE" || exit 1
+  assert_eq "config: PRIMER_ALT_CLI loaded" "ollama run llama3" "$PRIMER_ALT_CLI" || exit 1
+  assert_eq "config: PRIMER_GC_INTERVAL loaded" "7200" "$PRIMER_GC_INTERVAL" || exit 1
+) || _fail "config: subshell assertions failed (see above)"
 
-# Env var should override config file
 (
   export PRIMER_POOL_SIZE=2
   _test_load_config
-  assert_eq "config: env var wins over file" "2" "$PRIMER_POOL_SIZE"
-) || _fail "config override subshell failed"
-_pass "config: env var overrides file value"
+  assert_eq "config: env var wins over file" "2" "$PRIMER_POOL_SIZE" || exit 1
+) || _fail "config: env override subshell failed"
 
-# Comments and blank lines don't cause errors
 printf "# comment\n\nKEY=value\n" > "$TEST_DIR/clean.conf"
 (
   export PRIMER_CONFIG="$TEST_DIR/clean.conf"
   _test_load_config
-  assert_eq "config: plain key parsed" "value" "${KEY:-}"
-) 2>/dev/null || true
-_pass "config: comments and blank lines handled"
+  assert_eq "config: comments + blanks parsed" "value" "${KEY:-}" || exit 1
+) || _fail "config: comments/blanks subshell failed"
 
 # ── test: config-template ─────────────────────────────────────────────────────
 
@@ -276,15 +273,15 @@ echo "# No frontmatter here" > "$VAULT/1-Projects/myproject/no-frontmatter.md"
 echo "---" > "$VAULT/1-Projects/myproject/2026-04-01-topic.md"
 echo "---" > "$VAULT/2-Knowledge/2026-04-02-topic.md"
 
-# Dry run — should report strays but not move them
-output=$("$PRIMER_GC" --vault "$VAULT" 2>&1)
+# Dry run — should report strays but not move them (exits 2 when strays found)
+output=$("$PRIMER_GC" --vault "$VAULT" 2>&1) || true
 assert_contains "gc: stray file reported" "STRAY" "$output"
 assert_contains "gc: orphan.md reported" "orphan.md" "$output"
 
 # Stray files should still be in place after dry run
 assert_file_exists "gc: dry run does not move files" "$VAULT/stray-dir/orphan.md"
 
-# Auto mode — should move stray files
+# Auto mode — should move stray files (exits 0 when done)
 "$PRIMER_GC" --vault "$VAULT" --auto > /dev/null 2>&1 || true
 assert_file_missing "gc: auto moves stray to inbox" "$VAULT/stray-dir/orphan.md"
 assert_file_missing "gc: auto moves root stray to inbox" "$VAULT/random-note.md"
@@ -294,8 +291,8 @@ inbox_count=$(ls "$VAULT/_inbox/" | wc -l | tr -d ' ')
 [[ "$inbox_count" -ge 3 ]] && _pass "gc: moved files appear in _inbox" || \
   _fail "gc: expected ≥3 files in _inbox, got $inbox_count"
 
-# Lint check — should flag no-frontmatter
-output=$("$PRIMER_GC" --vault "$VAULT" --lint 2>&1)
+# Lint check — should flag no-frontmatter (exits 3 when lint issues found)
+output=$("$PRIMER_GC" --vault "$VAULT" --lint 2>&1) || true
 assert_contains "gc: lint flags missing frontmatter" "NO FRONTMATTER" "$output"
 assert_contains "gc: lint flags duplicate slugs" "DUPLICATE SLUG" "$output"
 
@@ -354,12 +351,24 @@ MOCK
     _fail "pool: daemon did not start"
   fi
 
-  # Trigger a warm
-  "$PRIMER" warm
-  sleep 3  # give warmup time
+  # Trigger a warm and wait for slot 0 to actually reach warm state.
+  # This catches regressions in warm_window where the CLI isn't launched
+  # or the warmup marker isn't detected.
+  "$PRIMER" warm > /dev/null 2>&1
 
-  status_out=$("$PRIMER" status 2>&1)
-  assert_contains "pool: status shows pool name" "$PRIMER_SESSION_PREFIX-pool" "$status_out"
+  waited=0
+  while [[ $waited -lt 15 ]]; do
+    state=$(cat "$PRIMER_DIR/state/slot-0" 2>/dev/null || echo "")
+    [[ "$state" == "warm" ]] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  assert_eq "pool: slot 0 reached warm state" "warm" "$state"
+
+  status_out=$("$PRIMER" status 2>&1) || true
+  assert_contains "pool: status shows pool name" "${PRIMER_SESSION_PREFIX}-pool" "$status_out"
+  assert_contains "pool: status shows slot 0" "slot 0" "$status_out"
+  assert_contains "pool: status shows warm indicator" "✓" "$status_out"
 
   # Stop daemon
   "$PRIMERD" stop > /dev/null 2>&1

@@ -187,13 +187,15 @@ warm_window() {
   log "Warming slot $slot ($(slot_label "$slot"))..."
   set_state "$slot" "warming"
 
+  # Launch the CLI unless the pane already shows the warmup marker
+  # (i.e. the CLI is already running from a previous warm attempt)
   local content
   content=$(pane_content "$window")
-  if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER" && ! echo "$content" | grep -q '\$'; then
+  if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER"; then
     send_keys "$window" "$cli"
+    sleep 2
   fi
 
-  sleep 2
   send_keys "$window" "$PRIMER_WARMUP_MSG"
 
   local waited=0
@@ -406,17 +408,15 @@ case "$cmd" in
       echo "primerd: not running"
     fi
     mkdir -p "$PRIMER_STATE_DIR"
-    local alt_slot="${PRIMER_ALT_SLOT:-$(_default_alt_slot)}"
     echo ""
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-      local state label alt_tag warm_tag
-      state=$(get_state "$slot")
-      label=$(get_slot_label "$slot")
-      alt_tag=""
-      warm_tag=""
-      is_alt_slot "$slot" && alt_tag=" [alt]"
-      [[ "$state" == "warm" ]] && warm_tag=" ✓"
-      printf "  slot %s [%s]%s: %s%s\n" "$slot" "$label" "$alt_tag" "$state" "$warm_tag"
+      _st_state=$(get_state "$slot")
+      _st_label=$(get_slot_label "$slot")
+      _st_alt_tag=""
+      _st_warm_tag=""
+      is_alt_slot "$slot" && _st_alt_tag=" [alt]"
+      [[ "$_st_state" == "warm" ]] && _st_warm_tag=" ✓"
+      printf "  slot %s [%s]%s: %s%s\n" "$slot" "$_st_label" "$_st_alt_tag" "$_st_state" "$_st_warm_tag"
     done
     ;;
   help|--help|-h)
