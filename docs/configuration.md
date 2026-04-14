@@ -35,7 +35,7 @@ primerd config-template > ~/.llm-primer/config
 |---|---|---|
 | `PRIMER_WARMUP_MSG` | primer-aware preamble | Message sent after launching the CLI |
 | `PRIMER_WARMUP_MARKER` | `SESSION START` | String to watch for that signals "warm" |
-| `PRIMER_WARMUP_TIMEOUT` | `60` | Seconds to wait before giving up |
+| `PRIMER_WARMUP_TIMEOUT` | `180` | Seconds to wait before giving up. Bump if your session start reads many files; lower for stock CLIs. |
 | `PRIMER_RESET_CMD` | `/clear` | Soft-reset command. `""` = kill+respawn. |
 
 ## File watcher (auto-rewarm)

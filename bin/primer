@@ -104,8 +104,18 @@ case "$cmd" in
     attach_slot="${2:-}"
     if [[ -z "$attach_slot" ]]; then
       if ! attach_slot=$(find_warm_slot); then
-        echo "⚠ No warm slots available. Attaching to slot 0 (may still be starting up)."
         attach_slot=0
+        echo "⚠ No warm slots available. Requesting warm on slot $attach_slot..."
+        touch "$PRIMER_DIR/warm-request-$attach_slot"
+        # Wait up to 10s for primerd to pick it up and at least transition to warming.
+        _attach_waited=0
+        while [[ $_attach_waited -lt 10 ]]; do
+          _attach_state=$(get_state "$attach_slot")
+          [[ "$_attach_state" == "warm" || "$_attach_state" == "warming" ]] && break
+          sleep 1
+          _attach_waited=$((_attach_waited + 1))
+        done
+        echo "→ Attaching anyway. You'll see the startup protocol run live if it's still warming."
       fi
     fi
     do_attach "$attach_slot"

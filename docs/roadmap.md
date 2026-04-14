@@ -26,6 +26,9 @@ Why warm pool and not a dedicated LLM: cost (no redundant context reload), fresh
 
 ## Future
 
+- **`primer cycle` — one-keystroke slot flip.** Warms a replacement and moves the current tmux client to it in place, so you never leave the tab you're in. Today the flow is `primer switch` → open new tab → `primer attach`. `primer cycle` collapses that into one command.
+- **Partial eager warming.** `PRIMER_EAGER_SLOTS=0,2` — warm primary + alt at daemon start, keep backup slot(s) lazy. Matches the common workflow of "main model + cheap model always ready, spare cold until you need it."
+- **`primer ask <slot> "question"`.** Non-interactive one-shot against a configured CLI. Pipes in/out (`primer ask alt "summarize" < log.txt`). Uses the CLI's headless mode, not the warm pool — composes naturally with shell tools.
 - **Go binary.** Single binary, no bash deps. Not a rewrite for rewrite's sake — only when the current script's limits are hurting (probably when Windows support or plugin ecosystem becomes a thing).
 - **`primer init` wizard.** Interactive setup: "what CLI do you use? What's your vault path? Need an alt slot?" → writes `~/.llm-primer/config` correctly.
 - **Linux packaging.** AUR PKGBUILD, Nix flake, maybe `.deb`. curl-pipe works but package managers are friendlier.

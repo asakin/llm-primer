@@ -63,7 +63,7 @@ PRIMER_RESET_CMD="${PRIMER_RESET_CMD:-/clear}"   # soft-reset command; "" = kill
 # first user turn in every warm session, so we use it to tell the LLM what
 # it's running in — which makes it a better collaborator (e.g. it can suggest
 # 'primer switch' proactively when context gets heavy).
-_default_warmup_msg='Hi, you are running inside llm-primer, a pre-warmed session pool. When my context gets heavy — around 70% of your window — remind me I can run `primer switch` to jump cleanly to a fresh session. Now please run your session start protocol.'
+_default_warmup_msg='You are running inside llm-primer, a pre-warmed session pool. Guidelines: (1) If my context approaches ~70% of your window, tell me once I can run `primer switch` in my shell to jump to a fresh session — do not repeat the reminder. (2) Suggest the alt slot if a question is quick or better suited to a cheaper/faster model. (3) `primer` commands are shell-only; never try to run them yourself. If I accidentally type one at you, briefly tell me to run it in my terminal. Now run your session start protocol.'
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-$_default_warmup_msg}"
 
 # Override for the alt slot (falls back to PRIMER_WARMUP_MSG if unset).
@@ -71,7 +71,13 @@ PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-$_default_warmup_msg}"
 PRIMER_ALT_WARMUP_MSG="${PRIMER_ALT_WARMUP_MSG:-}"
 
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"  # string that signals warmth
-PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-60}"  # seconds to wait for warm marker
+PRIMER_WARMUP_TIMEOUT="${PRIMER_WARMUP_TIMEOUT:-180}"  # seconds to wait for warm marker
+PRIMER_CLI_READY_WAIT="${PRIMER_CLI_READY_WAIT:-8}"  # seconds to wait for CLI TUI to be ready for input
+
+# Per-slot pane background colors — helps distinguish slots when eyeballing tmux
+# or taking screenshots. Empty = no tint. Comma-separated list, one entry per
+# slot in order. Any tmux-accepted color name or #RRGGBB hex works.
+PRIMER_SLOT_COLORS="${PRIMER_SLOT_COLORS:-#0d1b2a,#1b263b,#0e2a1a}"
 
 PRIMER_WATCH_DIR="${PRIMER_WATCH_DIR:-}"        # dir to watch for config changes
 PRIMER_WATCH_INTERVAL="${PRIMER_WATCH_INTERVAL:-5}"
@@ -169,7 +175,11 @@ is_warm() {
 
 send_keys() {
   local window="$1"; shift
-  tmux send-keys -t "${TMUX_SESSION}:${window}" "$*" Enter
+  # Type text, then submit with a brief gap so TUIs that debounce keystrokes
+  # (e.g. Claude Code) actually register the Enter as submission.
+  tmux send-keys -t "${TMUX_SESSION}:${window}" -l "$*"
+  sleep 0.3
+  tmux send-keys -t "${TMUX_SESSION}:${window}" Enter
 }
 
 # ── pool management ───────────────────────────────────────────────────────────
@@ -177,6 +187,8 @@ send_keys() {
 ensure_tmux_session() {
   if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux new-session -d -s "$TMUX_SESSION" -n "${PRIMER_SESSION_PREFIX}-0"
+    # Suppress tmux status bar so host TUI statuslines (e.g. Claude Code) show through.
+    tmux set-option -t "$TMUX_SESSION" status off 2>/dev/null || true
     log "Created tmux session: $TMUX_SESSION"
   fi
 }
@@ -193,6 +205,13 @@ next_slot() {
   return 1
 }
 
+slot_color() {
+  local slot="$1"
+  [[ -z "$PRIMER_SLOT_COLORS" ]] && return
+  IFS=',' read -r -a _colors <<< "$PRIMER_SLOT_COLORS"
+  echo "${_colors[$slot]:-}"
+}
+
 spawn_window() {
   local slot="$1"
   local window
@@ -200,6 +219,13 @@ spawn_window() {
   if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -q "^${window}$"; then
     tmux new-window -t "$TMUX_SESSION" -n "$window"
     log "Spawned window: $window"
+  fi
+  # Tint the pane background so slots are visually distinguishable when flipping
+  # between them or taking screenshots.
+  local color
+  color=$(slot_color "$slot")
+  if [[ -n "$color" ]]; then
+    tmux set-window-option -t "${TMUX_SESSION}:${window}" window-style "bg=${color}" 2>/dev/null || true
   fi
   set_state "$slot" "spawned"
 }
@@ -220,7 +246,10 @@ warm_window() {
   content=$(pane_content "$window")
   if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER"; then
     send_keys "$window" "$cli"
-    sleep 2
+    # Wait for the CLI TUI to finish booting before typing the preamble.
+    # Claude Code in particular can take 5–15s on a cold start; if we type
+    # too early the input or the trailing Enter gets dropped.
+    sleep "$PRIMER_CLI_READY_WAIT"
   fi
 
   send_keys "$window" "$(slot_warmup_msg "$slot")"
@@ -231,6 +260,10 @@ warm_window() {
       log "Slot $slot warm ✓ ($(slot_label "$slot"))"
       set_state "$slot" "warm"
       set_slot_label "$slot" "$(slot_label "$slot")"
+      # Drop scrollback so the user attaches into a clean pane instead of
+      # scrolling through the CLI's full startup output (and any prior
+      # warm attempts that left history behind).
+      tmux clear-history -t "${TMUX_SESSION}:${window}" 2>/dev/null || true
       return 0
     fi
     sleep 2
@@ -261,7 +294,7 @@ rewarm_window() {
     tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
     sleep 1
     send_keys "$window" "$cli"
-    sleep 2
+    sleep "$PRIMER_CLI_READY_WAIT"
   fi
 
   send_keys "$window" "$(slot_warmup_msg "$slot")"
@@ -503,7 +536,8 @@ Key variables:
   PRIMER_RESET_CMD        Soft-reset command (default: /clear). "" = kill+respawn.
   PRIMER_WARMUP_MSG       Message to send to trigger session init (default: ready)
   PRIMER_WARMUP_MARKER    String to watch for in output (default: SESSION START)
-  PRIMER_WARMUP_TIMEOUT   Seconds to wait for warmup (default: 60)
+  PRIMER_WARMUP_TIMEOUT   Seconds to wait for warmup (default: 180)
+  PRIMER_SLOT_COLORS      Comma-sep tmux bg colors per slot (default: #0d1b2a,#1b263b,#0e2a1a)
   PRIMER_WATCH_DIR        Dir to watch for config changes (triggers rewarm)
   PRIMER_GC_VAULT         Vault path for garbage collector (empty = disabled)
   PRIMER_GC_INTERVAL      Seconds between GC runs (default: 3600)
@@ -573,7 +607,7 @@ PRIMER_ALT_CLI=
 
 # ── warmup detection ──────────────────────────────────────────────────────────
 # PRIMER_WARMUP_MARKER=SESSION START
-# PRIMER_WARMUP_TIMEOUT=60
+# PRIMER_WARMUP_TIMEOUT=180
 
 # If your LLM CLI has no soft-reset command, set this to empty:
 # PRIMER_RESET_CMD=

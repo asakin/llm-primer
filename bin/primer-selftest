@@ -341,6 +341,132 @@ POLICY
 "$PRIMER_GC" --vault "$VAULT3" --auto > /dev/null 2>&1 || true
 assert_file_exists "gc: policy INBOX_DIR routes strays to custom dir" "$VAULT3/incoming/$(ls "$VAULT3/incoming" 2>/dev/null | head -1)"
 
+# ── test: send_keys literal + split Enter ────────────────────────────────────
+#
+# Regression: when the warmup message contains strings that tmux interprets as
+# key names (e.g. "Enter", "C-c"), they must be sent as literal text.  Also,
+# text and Enter must be sent as two separate calls so fast TUIs don't lose
+# the Enter to debounce.  This test asserts the source shape of send_keys.
+
+section "send_keys shape"
+
+set +e
+send_keys_fn=$(awk '/^send_keys\(\)/,/^}/' "$PRIMERD")
+
+if echo "$send_keys_fn" | grep -q -- '-l[[:space:]]*"\$\*"'; then
+  _pass "send_keys: uses -l (literal) for text"
+else
+  _fail "send_keys: does not use -l (literal) for text (regression)"
+fi
+
+# Count tmux send-keys invocations. Post-fix = 2 (text, Enter). Pre-fix = 1.
+sk_calls=$(echo "$send_keys_fn" | grep -c 'tmux send-keys')
+if [[ "$sk_calls" -ge 2 ]]; then
+  _pass "send_keys: text and Enter sent as separate tmux calls"
+else
+  _fail "send_keys: text and Enter bundled in one tmux call (regression)"
+fi
+
+# ── test: PRIMER_CLI_READY_WAIT configurable ─────────────────────────────────
+#
+# Regression: a hardcoded 2s sleep after launching the CLI isn't enough for
+# slower TUIs (Claude Code cold-starts in 5–15s).  Wait must be configurable.
+
+section "cli ready wait"
+
+if grep -q 'PRIMER_CLI_READY_WAIT' "$PRIMERD"; then
+  _pass "primerd: PRIMER_CLI_READY_WAIT env var present"
+else
+  _fail "primerd: PRIMER_CLI_READY_WAIT env var missing (regression)"
+fi
+
+# Look for a hardcoded `sleep 2` immediately following a `send_keys ... "$cli"`
+# (the specific anti-pattern). Poll loops that sleep 2s are legitimate.
+if grep -A1 'send_keys "\$window" "\$cli"' "$PRIMERD" | grep -qE '^[[:space:]]*sleep[[:space:]]+2[[:space:]]*$'; then
+  _fail "primerd: hardcoded 'sleep 2' after CLI launch (regression)"
+else
+  _pass "primerd: sleep after CLI launch is configurable"
+fi
+
+# ── test: per-slot pane colors ───────────────────────────────────────────────
+#
+# Slots get distinct tmux bg colors so they're easy to distinguish at a glance.
+# Test shape of the code, not a running tmux session.
+
+section "per-slot colors"
+
+set +e
+if grep -q 'PRIMER_SLOT_COLORS' "$PRIMERD"; then
+  _pass "primerd: PRIMER_SLOT_COLORS env var present"
+else
+  _fail "primerd: PRIMER_SLOT_COLORS env var missing (regression)"
+fi
+if grep -q 'window-style' "$PRIMERD"; then
+  _pass "primerd: spawn_window applies window-style"
+else
+  _fail "primerd: no window-style call — colors won't show (regression)"
+fi
+set -e
+
+# ── test: tmux status bar disabled ───────────────────────────────────────────
+#
+# Regression: tmux's default status bar obscures host TUI statuslines (e.g.
+# Claude Code's).  ensure_tmux_session must turn it off when creating the pool.
+
+section "tmux status off"
+
+ensure_fn=$(awk '/^ensure_tmux_session\(\)/,/^}/' "$PRIMERD")
+if echo "$ensure_fn" | grep -q 'status off'; then
+  _pass "primerd: ensure_tmux_session disables status bar"
+else
+  _fail "primerd: ensure_tmux_session does not disable status bar (regression)"
+fi
+
+# ── test: clear-history after warming ────────────────────────────────────────
+#
+# Regression: without clearing scrollback on success, the user attaches into a
+# pane full of the CLI's startup output (and any prior warm attempts' leftovers).
+
+section "clear-history on warm"
+
+set +e
+warm_fn=$(awk '/^warm_window\(\)/,/^rewarm_window\(\)/' "$PRIMERD")
+if echo "$warm_fn" | grep -q 'clear-history'; then
+  _pass "primerd: clears scrollback after warm"
+else
+  _fail "primerd: does not clear scrollback after warm (regression)"
+fi
+set -e
+
+# ── test: primer attach without warm slot triggers warm ──────────────────────
+#
+# Regression: running `primer attach` with no warm slot should request a warm
+# before attaching, not just jump into a cold pane.
+
+section "attach triggers warm"
+
+mkdir -p "$PRIMER_DIR/state"
+for s in 0 1 2; do echo "cold" > "$PRIMER_DIR/state/slot-$s"; done
+rm -f "$PRIMER_DIR"/warm-request*
+
+# Stub tmux so do_attach does not block on a real tmux session.
+mkdir -p "$TEST_DIR/stubs"
+cat > "$TEST_DIR/stubs/tmux" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$TEST_DIR/stubs/tmux"
+
+PATH="$TEST_DIR/stubs:$PATH" "$PRIMER" attach > /dev/null 2>&1 || true
+
+if [[ -f "$PRIMER_DIR/warm-request-0" ]] || [[ -f "$PRIMER_DIR/warm-request" ]]; then
+  _pass "attach: warm-request created when no warm slot"
+  rm -f "$PRIMER_DIR"/warm-request*
+else
+  _fail "attach: no warm-request created when no warm slot (regression)"
+fi
+set -e
+
 # ── test: help outputs ────────────────────────────────────────────────────────
 
 section "help"

@@ -50,16 +50,48 @@ The first attach triggers a warm; you'll see the startup protocol run live once.
 
 ---
 
-## Shortcuts worth aliasing
+## Moving between slots
 
+With a pool of N slots, you need a way to remember which is which. The commands:
+
+| Command | What it does |
+|---|---|
+| `primer attach` | Attach to a warm slot (first non-alt) |
+| `primer attach N` | Attach to a specific slot by number |
+| `primer alt` | Attach to the alt slot (cheap/fast CLI) |
+| `primer switch` | Pre-warm a replacement, tells you when to jump |
+| `primer status` | Show pool state — which slots are warm, which CLI each runs |
+
+Three ways to keep the commands in muscle memory:
+
+**Aliases** — two-keystroke invocations in your shell:
 ```bash
-alias cc='primer attach'    # warm session in two keystrokes
-alias ca='primer alt'       # jump to the alt slot (cheap/fast model)
+alias cc='primer attach'    # main slot
+alias ca='primer alt'       # alt slot (cheap/fast CLI)
+alias cb='primer attach 1'  # backup slot
 ```
 
-Or configure iTerm2 / your terminal profile to run `primer attach` as the shell command. Every new tab opens into a warm session.
+**Per-slot colors** — `PRIMER_SLOT_COLORS` tints each slot's pane so you can tell tabs apart at a glance:
+```ini
+PRIMER_SLOT_COLORS=#0d1b2a,#1b263b,#0e2a1a
+```
+
+**Terminal profile** — set `primer attach` as the shell command for your default iTerm / Ghostty / Warp profile. Every new tab opens into a warm session.
 
 ---
+
+## Always-warm setup (for heavy users)
+
+If you live in your LLM CLI and the startup cost is always worth paying up front, run eager mode. The pool warms every slot at daemon boot and keeps them fresh via the file watcher:
+
+```ini
+# ~/.llm-primer/config
+PRIMER_MODE=eager
+PRIMER_POOL_SIZE=3
+PRIMER_WATCH_DIR=/path/to/your/wiki/config
+```
+
+Pair it with the launchd agent (macOS) and every login brings up a fully-warmed pool. Not free — eager mode pays the session-start cost N times on each daemon restart, whether you end up using the slots or not. Lazy is the right default unless your attach-to-done loop is shorter than a typical workday.
 
 ## The other half: a garbage collector your LLM maintains
 
