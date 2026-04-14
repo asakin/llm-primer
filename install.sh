@@ -7,7 +7,8 @@ set -euo pipefail
 REPO="asakin/llm-primer"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
-LAUNCHD="${LAUNCHD:-}"   # set to "yes" to install launchd auto-start (macOS only)
+LAUNCHD="${LAUNCHD:-}"        # set to "yes" to install launchd auto-start (macOS only)
+VERSION="${VERSION:-main}"    # git ref to install from (tag, branch, or commit)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,7 +44,8 @@ check_deps() {
 # ── download ──────────────────────────────────────────────────────────────────
 
 download_files() {
-  local base_url="https://raw.githubusercontent.com/${REPO}/main"
+  local base_url="https://raw.githubusercontent.com/${REPO}/${VERSION}"
+  info "Installing from ${VERSION}"
   local tmp_dir
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT

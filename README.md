@@ -199,6 +199,10 @@ brew install llm-primer
 
 **Linux and macOS (curl):**
 ```bash
+# Latest release (recommended)
+curl -fsSL https://raw.githubusercontent.com/asakin/llm-primer/v0.5.0/install.sh | VERSION=v0.5.0 bash
+
+# Bleeding edge (tracks main)
 curl -fsSL https://raw.githubusercontent.com/asakin/llm-primer/main/install.sh | bash
 ```
 

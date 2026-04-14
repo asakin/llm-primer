@@ -182,6 +182,16 @@ MSG
     fi
     ;;
 
+  haiku|h)
+    # Deprecated: 'primer haiku' was renamed to 'primer alt' in v0.5.0 once
+    # the feature became LLM-agnostic. Keeping a helpful redirect for one
+    # release so anyone who muscle-memoried 'primer haiku' gets a clue.
+    echo "⚠ 'primer haiku' is now 'primer alt' (v0.5.0 made the slot LLM-agnostic)."
+    echo "  Configure PRIMER_ALT_CLI in ~/.llm-primer/config to use it."
+    echo "  Running 'primer alt' now..."
+    exec "$0" alt "${@:2}"
+    ;;
+
   start)  primerd start ;;
   stop)   primerd stop ;;
 
