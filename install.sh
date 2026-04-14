@@ -21,13 +21,33 @@ error()   { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
 
 # ── checks ────────────────────────────────────────────────────────────────────
 
+try_install_tmux() {
+  # Offer to install tmux via the system package manager. Returns 0 if installed.
+  if command -v brew &>/dev/null; then
+    info "tmux not found. Installing via Homebrew..."
+    brew install tmux && return 0
+  elif command -v apt-get &>/dev/null; then
+    info "tmux not found. Installing via apt-get (requires sudo)..."
+    sudo apt-get update && sudo apt-get install -y tmux && return 0
+  elif command -v dnf &>/dev/null; then
+    info "tmux not found. Installing via dnf (requires sudo)..."
+    sudo dnf install -y tmux && return 0
+  elif command -v pacman &>/dev/null; then
+    info "tmux not found. Installing via pacman (requires sudo)..."
+    sudo pacman -S --noconfirm tmux && return 0
+  fi
+  return 1
+}
+
 check_deps() {
-  local missing=()
-  for cmd in tmux curl; do
-    command -v "$cmd" &>/dev/null || missing+=("$cmd")
-  done
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    error "Missing required dependencies: ${missing[*]}"
+  if ! command -v tmux &>/dev/null; then
+    if ! try_install_tmux; then
+      error "tmux is required but not installed, and no supported package manager (brew/apt/dnf/pacman) was found. Install tmux manually and re-run."
+    fi
+  fi
+
+  if ! command -v curl &>/dev/null; then
+    error "Missing required dependency: curl"
   fi
 
   # Check for the configured CLI (defaults to claude if PRIMER_CLI isn't set yet).
