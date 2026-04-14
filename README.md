@@ -59,13 +59,30 @@ Or configure iTerm2 / your terminal profile to run `primer attach` as the shell 
 
 ---
 
+## The other half: a garbage collector your LLM maintains
+
+Drift in an LLM wiki comes from two directions. AI output in the wrong place, you fix with better instructions. Files *you* drop in the wrong place — late-night Obsidian captures, mis-saved downloads — those no instruction catches.
+
+`primer gc` is the worker that closes that loop. It scans your vault for `.md` files outside their allowed locations and moves them to your inbox so they flow through normal filing.
+
+The non-obvious part: rules live in a plain `.primer-gc` file at your vault root, and **your LLM maintains that file**. One line in your `CLAUDE.md`:
+
+```markdown
+The GC policy for this vault is at `.primer-gc`. When we add a new top-level
+content directory, update ALLOWED_DIRS. When the filename convention changes,
+update FILENAME_REGEX.
+```
+
+Now when you tell your LLM "let's add a `6-Recipes/` dir for cooking content," it updates the policy in the same conversation. The GC learns without you editing anything. The LLM is smart *periodically* — when conventions change — and its intelligence is frozen into a file a shell script can execute cheaply every hour.
+
+Full docs: [garbage-collector.md](docs/garbage-collector.md).
+
 ## What else it can do
 
 | | |
 |---|---|
 | [**Alt slot**](docs/alt-slot.md) | A second slot running a different CLI — Haiku for quick questions, Ollama for offline work, a totally different tool. Attach with `primer alt`. |
 | [**Context switching**](docs/context-switching.md) | When your context gets heavy, `primer switch` pre-warms a replacement and tells you when to jump. The default warmup message teaches the LLM to offer this proactively. |
-| [**Garbage collector**](docs/garbage-collector.md) | `primer gc` scans your vault for `.md` files that drifted into the wrong place and moves them to your inbox. Rules driven by a `.primer-gc` policy file your LLM can maintain. |
 | [**Self-test**](docs/self-test.md) | `primer selftest --fast` runs the full suite without touching your real pool or making any API calls. |
 | [**Full configuration**](docs/configuration.md) | Every environment variable, every config field, shell/terminal setup. |
 | [**Troubleshooting**](docs/troubleshooting.md) | "Pool not found", warmup timeouts, config ignored, alias collisions. |
