@@ -60,11 +60,17 @@ DEFAULT_INBOX_DIR="_inbox"
 DEFAULT_FILENAME_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$'
 DEFAULT_LINT_SKIP_DIRS=("_inbox")
 
+# Directories skipped during the scan. Default covers common dev artifacts
+# (node_modules, venv-style) plus any top-level dotdir (.git, .claude, .venv,
+# .obsidian, etc.). Extend via SCAN_EXCLUDE_DIRS in the policy file.
+DEFAULT_SCAN_EXCLUDE_DIRS=(node_modules _tools target build dist)
+
 # These get populated by load_vault_policy() — empty until the vault is known.
 ALLOWED_ROOT_FILES=()
 ALLOWED_DIRS=()
 ASSET_EXTENSIONS=()
 LINT_SKIP_DIRS=()
+SCAN_EXCLUDE_DIRS=()
 INBOX_DIR=""
 FILENAME_REGEX=""
 
@@ -188,6 +194,7 @@ while IFS= read -r item; do ALLOWED_ROOT_FILES+=("$item"); done < <(_populate_li
 while IFS= read -r item; do ALLOWED_DIRS+=("$item"); done       < <(_populate_list ALLOWED_DIRS       "${DEFAULT_ALLOWED_DIRS[@]}")
 while IFS= read -r item; do ASSET_EXTENSIONS+=("$item"); done   < <(_populate_list ASSET_EXTENSIONS   "${DEFAULT_ASSET_EXTENSIONS[@]}")
 while IFS= read -r item; do LINT_SKIP_DIRS+=("$item"); done     < <(_populate_list LINT_SKIP_DIRS     "${DEFAULT_LINT_SKIP_DIRS[@]}")
+while IFS= read -r item; do SCAN_EXCLUDE_DIRS+=("$item"); done  < <(_populate_list SCAN_EXCLUDE_DIRS  "${DEFAULT_SCAN_EXCLUDE_DIRS[@]}")
 
 INBOX_DIR=$(_policy_get INBOX_DIR);           [[ -z "$INBOX_DIR" ]]      && INBOX_DIR="$DEFAULT_INBOX_DIR"
 FILENAME_REGEX=$(_policy_get FILENAME_REGEX); [[ -z "$FILENAME_REGEX" ]] && FILENAME_REGEX="$DEFAULT_FILENAME_REGEX"
@@ -314,7 +321,21 @@ log "Scanning vault: $VAULT"
 $AUTO && log "Mode: auto (files will be moved)"
 $LINT_ONLY && log "Mode: lint only (no moves)"
 
-# Find all .md files, excluding git internals
+# Build a list of -prune clauses for find: all top-level dotdirs + the
+# configured SCAN_EXCLUDE_DIRS. Keeps the scan out of .git, .claude, node_modules,
+# etc. so git-worktree artifacts and vendored deps don't show up as strays.
+_scan_prunes=(-path "$VAULT/.*" -o)
+for d in "${SCAN_EXCLUDE_DIRS[@]}"; do
+  _scan_prunes+=(-path "$VAULT/$d" -o -path "$VAULT/$d/*" -o)
+done
+# Strip trailing -o
+unset '_scan_prunes[${#_scan_prunes[@]}-1]'
+
+_find_md() {
+  find "$VAULT" \( "${_scan_prunes[@]}" \) -prune -o -name "*.md" -type f -print0
+}
+
+# Find all .md files, skipping dotdirs and excluded trees
 while IFS= read -r -d '' file; do
   # Skip symlinks
   [[ -L "$file" ]] && continue
@@ -344,7 +365,7 @@ while IFS= read -r -d '' file; do
     warn "NO FRONTMATTER: $rel"
   fi
 
-done < <(find "$VAULT" -name "*.md" -not -path "*/.git/*" -print0)
+done < <(_find_md)
 
 # ── duplicate slug check ──────────────────────────────────────────────────────
 # Bash 3-compatible: collect all slugs into a temp file, then find duplicates
@@ -359,7 +380,7 @@ while IFS= read -r -d '' file; do
   _slug_base=$(basename "$file" .md)
   _slug="${_slug_base#????-??-??-}"   # strip YYYY-MM-DD- prefix if present
   printf '%s\t%s\n' "$_slug" "$file"  # tab-separated: slug TAB path
-done < <(find "$VAULT" -name "*.md" -not -path "*/.git/*" -print0) > "$_slug_tmp"
+done < <(_find_md) > "$_slug_tmp"
 
 # Find slugs that appear more than once
 while IFS= read -r dup_slug; do
