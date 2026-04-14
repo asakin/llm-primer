@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# Ensure Homebrew paths are visible when invoked from GUI contexts (e.g. Obsidian
+# terminal plugins) whose PATH doesn't inherit shell-rc additions.
+for _p in /opt/homebrew/bin /usr/local/bin; do
+  [[ ":$PATH:" != *":$_p:"* ]] && [[ -d "$_p" ]] && PATH="$_p:$PATH"
+done
+unset _p
+
 # ── config file loading ───────────────────────────────────────────────────────
 
 PRIMER_CONFIG="${PRIMER_CONFIG:-$HOME/.llm-primer/config}"

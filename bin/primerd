@@ -17,6 +17,13 @@
 
 set -euo pipefail
 
+# Ensure Homebrew paths are visible when invoked from GUI contexts (e.g. Obsidian
+# terminal plugins, launchd) whose PATH doesn't inherit shell-rc additions.
+for _p in /opt/homebrew/bin /usr/local/bin; do
+  [[ ":$PATH:" != *":$_p:"* ]] && [[ -d "$_p" ]] && PATH="$_p:$PATH"
+done
+unset _p
+
 # ── config file loading ───────────────────────────────────────────────────────
 #
 # Config file is a plain KEY=VALUE file — no bash syntax, no quoting required.
