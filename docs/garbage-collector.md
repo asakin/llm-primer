@@ -70,10 +70,12 @@ Add to `~/.llm-primer/config`:
 
 ```ini
 PRIMER_GC_VAULT=~/path/to/your/vault
-PRIMER_GC_INTERVAL=3600   # seconds between runs (1 hour)
+PRIMER_GC_INTERVAL=21600   # seconds between runs. Default: 6 hours.
 ```
 
 primerd runs the GC in the background every `PRIMER_GC_INTERVAL` seconds. Moved files appear in your inbox for normal triage.
+
+Most vaults don't need this running aggressively — drift accumulates over days, not minutes. Lower the interval if you're actively reorganizing or cleaning up; leave it at the default or higher for steady-state use.
 
 ## Exit codes
 

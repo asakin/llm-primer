@@ -50,7 +50,7 @@ primerd config-template > ~/.llm-primer/config
 | Variable | Default | What it does |
 |---|---|---|
 | `PRIMER_GC_VAULT` | *(empty)* | Vault path. Set to enable the GC cron in primerd. |
-| `PRIMER_GC_INTERVAL` | `3600` | Seconds between GC runs |
+| `PRIMER_GC_INTERVAL` | `21600` | Seconds between GC runs (6 hours). Lower = more aggressive. |
 
 ## Paths
 
