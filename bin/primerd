@@ -269,6 +269,7 @@ get_slot_label() {
 
 watch_warm_request() {
   while true; do
+    # Generic warm request — warms the first cold slot
     if [[ -f "$PRIMER_WARM_REQUEST" ]]; then
       rm -f "$PRIMER_WARM_REQUEST"
       log "Warm request received"
@@ -281,6 +282,29 @@ watch_warm_request() {
         log "All slots already warm or warming — ignoring warm request"
       fi
     fi
+
+    # Slot-targeted warm requests: warm-request-N warms slot N specifically.
+    # Used by `primer alt` to warm the alt slot on demand.
+    for req in "$PRIMER_DIR"/warm-request-*; do
+      [[ -f "$req" ]] || continue
+      local target_slot="${req##*/warm-request-}"
+      rm -f "$req"
+      if ! [[ "$target_slot" =~ ^[0-9]+$ ]] || [[ "$target_slot" -ge "$PRIMER_POOL_SIZE" ]]; then
+        log "Ignoring invalid warm-request-$target_slot"
+        continue
+      fi
+      local state
+      state=$(get_state "$target_slot")
+      if [[ "$state" == "warm" || "$state" == "warming" ]]; then
+        log "Slot $target_slot already warm/warming — ignoring targeted request"
+        continue
+      fi
+      log "Targeted warm request for slot $target_slot"
+      ensure_tmux_session
+      spawn_window "$target_slot"
+      warm_window "$target_slot" &
+    done
+
     sleep 2
   done
 }

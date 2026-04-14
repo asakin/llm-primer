@@ -53,13 +53,18 @@ _alt_slot() {
 }
 
 find_warm_slot() {
-  # Returns the first warm slot that is NOT the alt slot
+  # First pass: a warm non-alt slot. Falls back to the alt slot if nothing else
+  # is warm — better to hand the user a warm alt than a cold default slot.
   local alt_slot
   alt_slot=$(_alt_slot)
   for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
     [[ -n "$PRIMER_ALT_CLI" && "$slot" -eq "$alt_slot" ]] && continue
     is_warm "$slot" 2>/dev/null && { echo "$slot"; return 0; }
   done
+  if [[ -n "$PRIMER_ALT_CLI" ]] && is_warm "$alt_slot" 2>/dev/null; then
+    echo "$alt_slot"
+    return 0
+  fi
   return 1
 }
 
@@ -107,12 +112,28 @@ case "$cmd" in
   Example (Ollama):       PRIMER_ALT_CLI=ollama run llama3.2:1b
   Run: primerd config-template > ~/.llm-primer/config"
 
-    local alt_slot
-    alt_slot=$(_alt_slot)
-    if ! is_warm "$alt_slot" 2>/dev/null; then
-      echo "⚠ Alt slot $alt_slot not warm yet — attaching anyway (may still be starting up)."
+    _alt_target=$(_alt_slot)
+
+    # If the alt slot is cold, request a targeted warm and wait briefly.
+    _alt_state=$(get_state "$_alt_target")
+    if [[ "$_alt_state" != "warm" && "$_alt_state" != "warming" ]]; then
+      echo "→ Alt slot $_alt_target is $_alt_state. Requesting warm..."
+      touch "$PRIMER_DIR/warm-request-$_alt_target"
+
+      # Wait up to 10s for primerd to pick it up and at least transition to warming.
+      _alt_waited=0
+      while [[ $_alt_waited -lt 10 ]]; do
+        _alt_state=$(get_state "$_alt_target")
+        [[ "$_alt_state" == "warm" || "$_alt_state" == "warming" ]] && break
+        sleep 1
+        _alt_waited=$((_alt_waited + 1))
+      done
     fi
-    do_attach "$alt_slot"
+
+    if ! is_warm "$_alt_target" 2>/dev/null; then
+      echo "⚠ Alt slot not warm yet — attaching anyway. You'll see the startup protocol run live."
+    fi
+    do_attach "$_alt_target"
     ;;
 
   switch|sw)
@@ -148,17 +169,15 @@ MSG
       echo "pool: no tmux session found"
     else
       echo "pool: $TMUX_SESSION"
-      local alt_slot
-      alt_slot=$(_alt_slot)
+      _status_alt_slot=$(_alt_slot)
       for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-        local state label warm_tag alt_tag
-        state=$(get_state "$slot")
-        label=$(get_label "$slot")
-        warm_tag=""
-        alt_tag=""
-        is_warm "$slot" 2>/dev/null && warm_tag=" ✓"
-        [[ -n "$PRIMER_ALT_CLI" && "$slot" -eq "$alt_slot" ]] && alt_tag=" [alt]"
-        printf "  slot %s [%s]%s: %s%s\n" "$slot" "$label" "$alt_tag" "$state" "$warm_tag"
+        _status_state=$(get_state "$slot")
+        _status_label=$(get_label "$slot")
+        _status_warm_tag=""
+        _status_alt_tag=""
+        is_warm "$slot" 2>/dev/null && _status_warm_tag=" ✓"
+        [[ -n "$PRIMER_ALT_CLI" && "$slot" -eq "$_status_alt_slot" ]] && _status_alt_tag=" [alt]"
+        printf "  slot %s [%s]%s: %s%s\n" "$slot" "$_status_label" "$_status_alt_tag" "$_status_state" "$_status_warm_tag"
       done
     fi
     ;;
