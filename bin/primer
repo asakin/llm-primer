@@ -213,6 +213,7 @@ MSG
     # Run the self-test suite
     selftest_bin="$(dirname "$(command -v primer)")/primer-selftest"
     [[ -x "$selftest_bin" ]] || die "primer-selftest not found at $selftest_bin"
+    shift
     exec "$selftest_bin" "$@"
     ;;
 
