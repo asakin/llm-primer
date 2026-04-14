@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# primer — attach to and manage pre-warmed Claude Code sessions.
+
+set -euo pipefail
+
+# Make Homebrew paths visible when invoked from GUI contexts (Obsidian terminal
+# plugin, launchd) whose PATH doesn't inherit shell-rc additions.
+for _p in /opt/homebrew/bin /usr/local/bin; do
+  [[ ":$PATH:" != *":$_p:"* ]] && [[ -d "$_p" ]] && PATH="$_p:$PATH"
+done
+unset _p
+
+PRIMER_CONFIG="${PRIMER_CONFIG:-$HOME/.llm-primer/config}"
+
+_load_config() {
+  [[ -f "$PRIMER_CONFIG" ]] || return 0
+  while IFS='=' read -r key value; do
+    [[ "$key" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${key// }" ]] && continue
+    key="${key// /}"
+    [[ -n "${!key+set}" ]] && continue
+    export "$key"="$value"
+  done < "$PRIMER_CONFIG"
+}
+
+_load_config
+
+PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
+PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
+PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
+
+die() { echo "error: $*" >&2; exit 1; }
+require() { command -v "$1" &>/dev/null || die "'$1' is required but not installed"; }
+
+window_name() { echo "${PRIMER_SESSION_PREFIX}-$1"; }
+get_state()   { local f="$PRIMER_DIR/state/slot-${1}"; [[ -f "$f" ]] && cat "$f" || echo "unknown"; }
+
+pane_content() {
+  tmux capture-pane -t "${TMUX_SESSION}:${1}" -p 2>/dev/null || echo ""
+}
+
+is_warm() {
+  pane_content "$(window_name "$1")" | grep -qF "${PRIMER_WARMUP_MARKER:-SESSION START}"
+}
+
+find_warm_slot() {
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    is_warm "$slot" 2>/dev/null && { echo "$slot"; return 0; }
+  done
+  return 1
+}
+
+do_attach() {
+  local slot="$1"
+  local window
+  window=$(window_name "$slot")
+  echo "→ Attaching to slot $slot (state: $(get_state "$slot"))"
+
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "${TMUX_SESSION}:${window}" || \
+      die "Slot $slot not found. Is primerd running?"
+  else
+    if ! tmux attach-session -t "${TMUX_SESSION}:${window}"; then
+      echo ""
+      die "Could not attach. If you're in Obsidian's terminal plugin or another non-TTY shell, run 'primer' from iTerm / your native terminal instead."
+    fi
+  fi
+}
+
+cmd="${1:-attach}"
+
+case "$cmd" in
+  attach|a|"")
+    require tmux
+    attach_slot="${2:-}"
+    if [[ -z "$attach_slot" ]]; then
+      if ! attach_slot=$(find_warm_slot); then
+        attach_slot=0
+        echo "⚠ No warm slots available. Requesting warm on slot $attach_slot..."
+        touch "$PRIMER_DIR/warm-request"
+        waited=0
+        while [[ $waited -lt 10 ]]; do
+          state=$(get_state "$attach_slot")
+          [[ "$state" == "warm" || "$state" == "warming" ]] && break
+          sleep 1
+          waited=$((waited + 1))
+        done
+        echo "→ Attaching anyway. You'll see the startup protocol run live if it's still warming."
+      fi
+    fi
+    do_attach "$attach_slot"
+    ;;
+
+  switch|sw)
+    touch "$PRIMER_DIR/warm-request"
+    cat <<'MSG'
+→ Switch requested. primerd is warming a fresh session.
+
+When you're ready to switch:
+  1. Open a new terminal (or new iTerm tab / Obsidian terminal tab)
+  2. Run: primer
+
+Your current session stays open. Copy anything you need before closing it.
+MSG
+    ;;
+
+  warm|w)
+    touch "$PRIMER_DIR/warm-request"
+    echo "→ Warm request sent. primerd will start warming a slot."
+    ;;
+
+  status|s)
+    require tmux
+    if [[ -f "$PRIMER_DIR/primerd.pid" ]] && kill -0 "$(cat "$PRIMER_DIR/primerd.pid")" 2>/dev/null; then
+      echo "daemon: running (pid $(cat "$PRIMER_DIR/primerd.pid"))"
+    else
+      echo "daemon: not running (start with 'primer start')"
+    fi
+    echo ""
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      echo "pool: no tmux session found"
+    else
+      echo "pool: $TMUX_SESSION"
+      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+        state=$(get_state "$slot")
+        warm_tag=""
+        is_warm "$slot" 2>/dev/null && warm_tag=" ✓"
+        printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_tag"
+      done
+    fi
+    ;;
+
+  start) primerd start ;;
+  stop)  primerd stop ;;
+
+  logs|log)
+    log_file="$PRIMER_DIR/primerd.log"
+    [[ -f "$log_file" ]] && tail -f "$log_file" || echo "No log file found at $log_file"
+    ;;
+
+  help|--help|-h)
+    cat <<'HELP'
+primer — llm-primer
+
+Attach to a pre-warmed Claude Code session instantly.
+
+Usage:
+  primer [attach]       Attach to a warm session
+  primer switch         Pre-warm a replacement and print switch instructions
+  primer warm           Signal primerd to warm a session now
+  primer status         Show pool and daemon status
+  primer start          Start the primerd daemon
+  primer stop           Stop the primerd daemon
+  primer logs           Tail the daemon log
+
+Configuration:
+  ~/.llm-primer/config  KEY=value pairs. See README for details.
+
+Environment:
+  PRIMER_CLI            CLI command (default: claude)
+  PRIMER_POOL_SIZE      Pool size (default: 2)
+  PRIMER_WATCH_DIR      Dir to rewarm on changes
+  PRIMER_WARMUP_MARKER  String signaling warmth (default: SESSION START)
+
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $cmd. Run 'primer help' for usage."
+    exit 1
+    ;;
+esac
