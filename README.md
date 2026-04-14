@@ -1,10 +1,12 @@
 # llm-primer
 
-Pre-warmed LLM CLI sessions in tmux. Attach instantly, skip the startup protocol.
+Two tools for anyone running an [LLM wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): a pool of pre-warmed sessions so you skip the startup protocol, and a garbage collector that catches drift before it compounds.
 
-Built because a loaded-up Claude Code session takes 30–60 seconds to initialize before you can type: it reads `CLAUDE.md`, runs the session-start protocol, checks inbox state, spend, publishing signals. Every session. llm-primer runs that in the background so you don't wait.
+If your `CLAUDE.md` loads a session-start protocol — inbox state, spend, publishing signals, the kind of thing you see across Karpathy-inspired wikis — a cold session takes 30–60 seconds to initialize before you can type. llm-primer runs that in the background so you don't wait.
 
-Works with any LLM CLI that prints something recognizable when it's ready: Claude Code, Aider, Ollama, Gemini CLI, Simon Willison's `llm`.
+The GC is the other half. LLM wikis degrade from lack of tidiness that accumulates over time — files dropped in the wrong location, conventions that slip, frontmatter that disappears. Small, invisible individually. Collectively fatal to the AI's ability to navigate what you've built. `primer gc` walks your vault on a policy **your LLM maintains** and moves strays to your inbox. Smart work once, when conventions change. Not continuously.
+
+Works with any LLM CLI that prints a recognizable marker when it's ready: Claude Code, Aider, Ollama, Gemini CLI, Simon Willison's `llm`.
 
 ---
 
@@ -61,7 +63,7 @@ Or configure iTerm2 / your terminal profile to run `primer attach` as the shell 
 
 ## The other half: a garbage collector your LLM maintains
 
-Drift in an LLM wiki comes from two directions. AI output in the wrong place, you fix with better instructions. Files *you* drop in the wrong place — late-night Obsidian captures, mis-saved downloads — those no instruction catches.
+Untidiness in an LLM wiki comes from two directions. AI output in the wrong place, you fix with better instructions. Files *you* drop in the wrong place — late-night Obsidian captures, mis-saved downloads, notes dashed off wherever the cursor happened to be — those no instruction catches. They accumulate.
 
 `primer gc` is the worker that closes that loop. It scans your vault for `.md` files outside their allowed locations and moves them to your inbox so they flow through normal filing.
 
