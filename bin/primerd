@@ -504,6 +504,11 @@ Key variables:
 Full config reference: https://github.com/asakin/llm-primer#configuration
 HELP
     ;;
+  _slot-cli)
+    # Hidden helper — used by the selftest to verify slot CLI resolution.
+    # Not in `primerd help`.
+    slot_cli "${2:-0}"
+    ;;
   config-template)
     cat <<'TEMPLATE'
 # ~/.llm-primer/config

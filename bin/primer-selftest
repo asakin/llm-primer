@@ -190,34 +190,32 @@ assert_contains "config-template: aider example present" "aider" "$output"
 
 section "alt slot"
 
-# slot_cli logic: test by sourcing primerd functions in a subshell
-(
-  export PRIMER_POOL_SIZE=3
-  export PRIMER_CLI=claude
-  export PRIMER_ALT_CLI="ollama run llama3"
-  export PRIMER_ALT_SLOT=2
+# Use the hidden `primerd _slot-cli` subcommand to verify per-slot CLI resolution
+# without sourcing internals (portable across bash versions).
+# Env vars are set per-command so assertions run in the parent shell and count correctly.
 
-  # Source just the function definitions
-  source <(sed -n '/^_default_alt_slot/,/^slot_label/p' "$PRIMERD" 2>/dev/null || true)
+_alt_base_env=(PRIMER_POOL_SIZE=3 PRIMER_CLI=claude PRIMER_ALT_CLI="ollama run llama3" PRIMER_ALT_SLOT=2 PRIMER_CONFIG=/dev/null)
 
-  if declare -f slot_cli &>/dev/null; then
-    result=$(slot_cli 0)
-    assert_eq "alt: slot 0 uses PRIMER_CLI" "claude" "$result"
-    result=$(slot_cli 2)
-    assert_eq "alt: slot 2 uses PRIMER_ALT_CLI" "ollama run llama3" "$result"
-  else
-    _skip "alt: slot_cli function not sourceable (bash version limitation)"
-  fi
-) 2>/dev/null || _skip "alt: subshell sourcing not supported"
+result=$(env "${_alt_base_env[@]}" "$PRIMERD" _slot-cli 0)
+assert_eq "alt: slot 0 uses PRIMER_CLI" "claude" "$result"
 
-# Test that primer alt fails helpfully when PRIMER_ALT_CLI is not set
-(
-  unset PRIMER_ALT_CLI 2>/dev/null || true
-  export PRIMER_ALT_CLI=""
-  output=$("$PRIMER" alt 2>&1 || true)
-  assert_contains "alt: helpful error when not configured" "PRIMER_ALT_CLI" "$output"
-)
-_pass "alt: error message references PRIMER_ALT_CLI"
+result=$(env "${_alt_base_env[@]}" "$PRIMERD" _slot-cli 1)
+assert_eq "alt: slot 1 uses PRIMER_CLI" "claude" "$result"
+
+result=$(env "${_alt_base_env[@]}" "$PRIMERD" _slot-cli 2)
+assert_eq "alt: slot 2 uses PRIMER_ALT_CLI" "ollama run llama3" "$result"
+
+# Per-slot override takes priority over alt assignment
+result=$(env "${_alt_base_env[@]}" PRIMER_SLOT_2_CLI="aider --model gpt-4o" "$PRIMERD" _slot-cli 2)
+assert_eq "alt: PRIMER_SLOT_2_CLI overrides alt" "aider --model gpt-4o" "$result"
+
+# Empty PRIMER_ALT_CLI means uniform pool — all slots use PRIMER_CLI
+result=$(env PRIMER_POOL_SIZE=3 PRIMER_CLI=claude PRIMER_ALT_CLI="" PRIMER_CONFIG=/dev/null "$PRIMERD" _slot-cli 2)
+assert_eq "alt: uniform pool when PRIMER_ALT_CLI empty" "claude" "$result"
+
+# primer alt fails helpfully when PRIMER_ALT_CLI is not set
+output=$(env PRIMER_ALT_CLI="" PRIMER_CONFIG=/dev/null "$PRIMER" alt 2>&1 || true)
+assert_contains "alt: helpful error when not configured" "PRIMER_ALT_CLI" "$output"
 
 # ── test: primer switch ───────────────────────────────────────────────────────
 
