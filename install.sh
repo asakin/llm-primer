@@ -29,10 +29,14 @@ check_deps() {
     error "Missing required dependencies: ${missing[*]}"
   fi
 
-  if ! command -v claude &>/dev/null; then
-    warn "Claude Code ('claude') not found in PATH."
-    warn "Install it from: https://claude.ai/code"
-    warn "llm-primer will install, but won't work until claude is available."
+  # Check for the configured CLI (defaults to claude if PRIMER_CLI isn't set yet).
+  local cli_cmd="${PRIMER_CLI:-claude}"
+  local cli_bin="${cli_cmd%% *}"
+  if ! command -v "$cli_bin" &>/dev/null; then
+    warn "'$cli_bin' not found in PATH."
+    warn "llm-primer will install, but your configured LLM CLI must be"
+    warn "available before it works. Set PRIMER_CLI in ~/.llm-primer/config"
+    warn "to use a different tool (aider, ollama, gemini, etc.)."
   fi
 }
 
@@ -45,22 +49,20 @@ download_files() {
   trap 'rm -rf "$tmp_dir"' EXIT
 
   info "Downloading llm-primer..."
-  curl -fsSL "${base_url}/bin/primer"    -o "$tmp_dir/primer"
-  curl -fsSL "${base_url}/bin/primerd"   -o "$tmp_dir/primerd"
-  curl -fsSL "${base_url}/bin/primer-gc" -o "$tmp_dir/primer-gc"
-
-  chmod +x "$tmp_dir/primer" "$tmp_dir/primerd" "$tmp_dir/primer-gc"
+  local bins=(primer primerd primer-gc primer-selftest)
+  for bin in "${bins[@]}"; do
+    curl -fsSL "${base_url}/bin/${bin}" -o "$tmp_dir/${bin}"
+    chmod +x "$tmp_dir/${bin}"
+  done
 
   if [[ -w "$INSTALL_DIR" ]]; then
-    cp "$tmp_dir/primer" "$tmp_dir/primerd" "$tmp_dir/primer-gc" "$INSTALL_DIR/"
+    for bin in "${bins[@]}"; do cp "$tmp_dir/${bin}" "$INSTALL_DIR/"; done
   else
     info "Installing to $INSTALL_DIR (requires sudo)..."
-    sudo cp "$tmp_dir/primer" "$tmp_dir/primerd" "$tmp_dir/primer-gc" "$INSTALL_DIR/"
+    for bin in "${bins[@]}"; do sudo cp "$tmp_dir/${bin}" "$INSTALL_DIR/"; done
   fi
 
-  info "Installed: $INSTALL_DIR/primer"
-  info "Installed: $INSTALL_DIR/primerd"
-  info "Installed: $INSTALL_DIR/primer-gc"
+  for bin in "${bins[@]}"; do info "Installed: $INSTALL_DIR/${bin}"; done
 }
 
 # ── state dir ─────────────────────────────────────────────────────────────────
@@ -85,6 +87,8 @@ install_launchd() {
 
   mkdir -p "$plist_dir"
 
+  # Note: no PRIMER_MODE / PRIMER_POOL_SIZE injected here. Let ~/.llm-primer/config
+  # drive those so edits in one place don't need a plist regeneration.
   cat > "$plist_file" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -114,10 +118,6 @@ install_launchd() {
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PRIMER_MODE</key>
-    <string>lazy</string>
-    <key>PRIMER_POOL_SIZE</key>
-    <string>3</string>
     <key>HOME</key>
     <string>${HOME}</string>
     <key>PATH</key>
@@ -147,31 +147,35 @@ suggest_shell_setup() {
 
 ${GREEN}✓${NC} llm-primer installed!
 
+Next steps:
+  1. Generate a config file:
+     primerd config-template > ~/.llm-primer/config
+
+  2. Edit it to set PRIMER_CLI (and optionally PRIMER_ALT_CLI).
+
+  3. Start the pool:
+     primerd start                   # manual, or skip if launchd is set up
+
 Quick start:
-  primerd start          # start the pool daemon
-  primer attach          # attach to a warm claude session
-  primer haiku           # attach to the cheap haiku session
+  primer attach          # attach to a warm session
+  primer alt             # attach to the alt slot (if configured)
   primer switch          # pre-warm a replacement when context gets heavy
   primer status          # check pool health
+  primer selftest --fast # verify the install
 
-Recommended: add to $shell_rc
+Recommended shell aliases ($shell_rc):
+  alias cc='primer attach'    # warm session in two keystrokes
+  alias ca='primer alt'       # jump to alt slot
 
-  # llm-primer
-  export PRIMER_WATCH_DIR=~/path/to/your/vault/_config
-  export PRIMER_GC_VAULT=~/path/to/your/vault
-  alias cc='primer attach'      # warm claude session in two keystrokes
-  alias ch='primer haiku'       # switch to haiku for quick tasks
+iTerm2: Preferences → Profiles → [your profile] → General → Command
+  Set to: ${INSTALL_DIR}/primer attach
+  Every new tab opens directly into a warm session.
 
-iTerm2 auto-open setup:
-  In iTerm2: Preferences → Profiles → [your profile] → General → Command
-  Set to: /usr/local/bin/primer attach
-  Now every new iTerm2 tab opens directly into a warm session.
+Obsidian embedded terminal (ObsidianTerminal plugin):
+  Set "Custom Shell Command" to: primer attach
 
-  If you use the Obsidian embedded terminal (ObsidianTerminal plugin):
-  Set the "Custom Shell Command" to: primer attach
-
-  Both require primerd to already be running. With launchd (macOS), that's
-  automatic on login. Otherwise run: primerd start
+Both require primerd to already be running. The launchd agent (macOS)
+starts it automatically on login.
 
 EOF
 }
