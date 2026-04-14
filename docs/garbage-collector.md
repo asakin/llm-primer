@@ -83,6 +83,70 @@ primerd runs the GC in the background every `PRIMER_GC_INTERVAL` seconds. Moved 
 
 Useful for CI or scripting.
 
+## Examples
+
+### llm-context-base vault
+
+[llm-context-base](https://github.com/asakin/llm-context-base) is the LLM wiki framework that motivated this tool. If your vault uses its numbered-directory convention (`0-Ideas/`, `1-Projects/`, etc.), here's a working `.primer-gc`:
+
+```ini
+# .primer-gc
+ALLOWED_DIRS=0-Ideas,1-Projects,2-Knowledge,3-Journal,4-Private,5-Publishing,6-Experiments,docs
+ALLOWED_ROOT_FILES=README.md,PHILOSOPHY.md,CLAUDE.md,LICENSE,CONTRIBUTING.md,CHANGELOG.md,DASHBOARD.md
+INBOX_DIR=_inbox
+LINT_SKIP_DIRS=_inbox,3-Journal
+FILENAME_REGEX=^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$
+```
+
+And the `CLAUDE.md` snippet that makes Claude maintain it:
+
+```markdown
+## GC policy maintenance
+
+The file at `.primer-gc` (vault root) drives llm-primer's garbage collector.
+It's plain KEY=value — no bash syntax, no quoting.
+
+When conventions change, update .primer-gc in the same commit:
+- New top-level content directory → add to ALLOWED_DIRS
+- New root-level convention file (AGENTS.md, GEMINI.md, etc.) → add to ALLOWED_ROOT_FILES
+- Filename standard changes → update FILENAME_REGEX
+- New raw-capture zone (dir where frontmatter isn't required) → add to LINT_SKIP_DIRS
+
+Never run `primer gc --auto` without explicit approval. Dry run and --lint are safe.
+
+When an inbox file looks like a GC rescue (today's date prefix, came from another
+location per primerd.log), triage it normally — figure out where it really belongs.
+```
+
+### PARA method vault
+
+If you're using Tiago Forte's PARA system:
+
+```ini
+# .primer-gc
+ALLOWED_DIRS=1-Projects,2-Areas,3-Resources,4-Archives
+ALLOWED_ROOT_FILES=README.md,INDEX.md
+INBOX_DIR=0-Inbox
+LINT_SKIP_DIRS=0-Inbox
+FILENAME_REGEX=
+```
+
+Empty `FILENAME_REGEX` disables the naming lint — PARA doesn't have a filename convention beyond the folder.
+
+### Zettelkasten
+
+```ini
+# .primer-gc
+ALLOWED_DIRS=zettel,index,archive
+ALLOWED_ROOT_FILES=README.md
+INBOX_DIR=inbox
+FILENAME_REGEX=^[0-9]{12}-[a-z0-9-]+\.md$
+```
+
+Filename regex matches the `YYYYMMDDHHmm-title.md` Zettelkasten convention.
+
+---
+
 ## Coming in v0.6.0
 
 Static rules handle the obvious 95%. The remaining 5% — "is this file actually misplaced, or just unusual?" — deserves LLM judgment. Planned: ambiguous files get queued for an idle warm session to review, with decisions applied as moves. See [roadmap.md](roadmap.md).

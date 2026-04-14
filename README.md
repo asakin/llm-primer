@@ -65,17 +65,30 @@ Drift in an LLM wiki comes from two directions. AI output in the wrong place, yo
 
 `primer gc` is the worker that closes that loop. It scans your vault for `.md` files outside their allowed locations and moves them to your inbox so they flow through normal filing.
 
-The non-obvious part: rules live in a plain `.primer-gc` file at your vault root, and **your LLM maintains that file**. One line in your `CLAUDE.md`:
+The non-obvious part: rules live in a plain `.primer-gc` file at your vault root, and **your LLM maintains that file**.
+
+Example — a real `.primer-gc` for an [llm-context-base](https://github.com/asakin/llm-context-base) vault:
+
+```ini
+ALLOWED_DIRS=0-Ideas,1-Projects,2-Knowledge,3-Journal,4-Private,5-Publishing,docs
+ALLOWED_ROOT_FILES=README.md,PHILOSOPHY.md,CLAUDE.md,CONTRIBUTING.md
+INBOX_DIR=_inbox
+LINT_SKIP_DIRS=_inbox,3-Journal
+FILENAME_REGEX=^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md$
+```
+
+And the `CLAUDE.md` snippet that tells Claude to keep it current:
 
 ```markdown
 The GC policy for this vault is at `.primer-gc`. When we add a new top-level
-content directory, update ALLOWED_DIRS. When the filename convention changes,
-update FILENAME_REGEX.
+content directory, update ALLOWED_DIRS. When we introduce a new root-level
+convention file, update ALLOWED_ROOT_FILES. When the filename convention
+changes, update FILENAME_REGEX. Never run `primer gc --auto` without approval.
 ```
 
-Now when you tell your LLM "let's add a `6-Recipes/` dir for cooking content," it updates the policy in the same conversation. The GC learns without you editing anything. The LLM is smart *periodically* — when conventions change — and its intelligence is frozen into a file a shell script can execute cheaply every hour.
+Now when you tell Claude "let's add a `6-Recipes/` dir for cooking content," it updates the policy in the same conversation. The GC learns without you editing anything. The LLM is smart *periodically* — when conventions change — and its intelligence is frozen into a file a shell script can execute cheaply every hour.
 
-Full docs: [garbage-collector.md](docs/garbage-collector.md).
+More examples (PARA, Zettelkasten) and full field reference: [garbage-collector.md](docs/garbage-collector.md).
 
 ## What else it can do
 
