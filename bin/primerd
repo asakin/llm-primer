@@ -8,14 +8,21 @@
 #                    CLAUDE.md instruction, or `primer warm`). Zero idle cost.
 #   eager           — always keeps PRIMER_POOL_SIZE sessions warm. Set
 #                    PRIMER_MODE=eager to opt in.
+#
+# Pool layout (default, pool size 3):
+#   slot 0  — primary session (claude)
+#   slot 1  — standby session (claude)
+#   slot 2  — haiku slot (claude --model claude-haiku-4-5-20251001)
+#
+# Override any slot's CLI with PRIMER_SLOT_{N}_CLI env var.
 
 set -euo pipefail
 
 PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
 PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
-PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-3}"
 PRIMER_MODE="${PRIMER_MODE:-lazy}"        # lazy | eager
-PRIMER_CLI="${PRIMER_CLI:-claude}"        # command to launch the LLM session
+PRIMER_CLI="${PRIMER_CLI:-claude}"        # default CLI for all slots
 PRIMER_RESET_CMD="${PRIMER_RESET_CMD:-/clear}"  # command to reset session context; set to "" to kill+respawn instead
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-ready}"
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"
@@ -25,6 +32,17 @@ PRIMER_PID_FILE="$PRIMER_DIR/primerd.pid"
 PRIMER_LOG_FILE="$PRIMER_DIR/primerd.log"
 PRIMER_STATE_DIR="$PRIMER_DIR/state"
 PRIMER_WARM_REQUEST="$PRIMER_DIR/warm-request"  # touch this to trigger lazy warm
+
+# Haiku slot — which pool slot runs the cheap model.
+# Default: last slot (PRIMER_POOL_SIZE - 1).
+# Set to -1 to disable. Override with PRIMER_HAIKU_SLOT env var.
+PRIMER_HAIKU_SLOT="${PRIMER_HAIKU_SLOT:-}"
+PRIMER_HAIKU_CLI="${PRIMER_HAIKU_CLI:-claude --model claude-haiku-4-5-20251001}"
+
+# Garbage collector — run primer-gc on a cron inside primerd.
+# Set PRIMER_GC_VAULT to your vault path to enable. Leave empty to disable.
+PRIMER_GC_VAULT="${PRIMER_GC_VAULT:-}"
+PRIMER_GC_INTERVAL="${PRIMER_GC_INTERVAL:-3600}"  # seconds between GC runs (default: 1h)
 
 # Directory to watch for config changes (triggers /clear + rewarm)
 PRIMER_WATCH_DIR="${PRIMER_WATCH_DIR:-}"
@@ -43,6 +61,50 @@ die() {
 
 require() {
   command -v "$1" &>/dev/null || die "'$1' is required but not installed"
+}
+
+# ── per-slot CLI resolution ────────────────────────────────────────────────────
+#
+# Resolution order for a given slot N:
+#   1. PRIMER_SLOT_{N}_CLI env var (explicit per-slot override)
+#   2. Haiku slot assignment (PRIMER_HAIKU_SLOT)
+#   3. PRIMER_CLI (global default)
+
+_default_haiku_slot() {
+  echo $(( PRIMER_POOL_SIZE - 1 ))
+}
+
+slot_cli() {
+  local slot="$1"
+
+  # Explicit per-slot override takes priority
+  local var="PRIMER_SLOT_${slot}_CLI"
+  if [[ -n "${!var:-}" ]]; then
+    echo "${!var}"
+    return
+  fi
+
+  # Haiku slot assignment
+  local haiku_slot="${PRIMER_HAIKU_SLOT:-$(_default_haiku_slot)}"
+  if [[ "$slot" -eq "$haiku_slot" ]] && [[ "$haiku_slot" -ne -1 ]]; then
+    echo "$PRIMER_HAIKU_CLI"
+    return
+  fi
+
+  echo "$PRIMER_CLI"
+}
+
+slot_model_label() {
+  local slot="$1"
+  local cli
+  cli=$(slot_cli "$slot")
+  if echo "$cli" | grep -q "haiku"; then
+    echo "haiku"
+  elif echo "$cli" | grep -q "opus"; then
+    echo "opus"
+  else
+    echo "claude"
+  fi
 }
 
 # ── tmux helpers ──────────────────────────────────────────────────────────────
@@ -76,7 +138,7 @@ ensure_tmux_session() {
   fi
 }
 
-# Returns the index of the next unused slot (creating it if needed), or 1 if pool is full
+# Returns the index of the next unused slot (creating it if needed), or exits 1 if pool is full
 next_slot() {
   for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
     local state
@@ -115,14 +177,16 @@ warm_window() {
   local slot="$1"
   local window
   window=$(window_name "$slot")
+  local cli
+  cli=$(slot_cli "$slot")
 
-  log "Warming slot $slot..."
+  log "Warming slot $slot (cli: $cli)..."
   set_state "$slot" "warming"
 
   local content
   content=$(pane_content "$window")
   if ! echo "$content" | grep -qF "$PRIMER_WARMUP_MARKER" && ! echo "$content" | grep -q '\$'; then
-    send_keys "$window" "$PRIMER_CLI"
+    send_keys "$window" "$cli"
   fi
 
   sleep 2
@@ -131,8 +195,9 @@ warm_window() {
   local waited=0
   while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
     if is_warm "$window"; then
-      log "Slot $slot is warm ✓"
+      log "Slot $slot is warm ✓ ($(slot_model_label "$slot"))"
       set_state "$slot" "warm"
+      set_model "$slot" "$(slot_model_label "$slot")"
       return 0
     fi
     sleep 2
@@ -147,8 +212,10 @@ rewarm_window() {
   local slot="$1"
   local window
   window=$(window_name "$slot")
+  local cli
+  cli=$(slot_cli "$slot")
 
-  log "Re-warming slot $slot..."
+  log "Re-warming slot $slot (cli: $cli)..."
   set_state "$slot" "rewarming"
 
   if [[ -n "$PRIMER_RESET_CMD" ]]; then
@@ -157,13 +224,12 @@ rewarm_window() {
     sleep 1
   else
     # Hard reset — kill current process and respawn the CLI
-    # Used when the CLI has no soft-reset command
     log "Slot $slot: no PRIMER_RESET_CMD set, using kill+respawn"
     tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
     sleep 1
     tmux send-keys -t "${TMUX_SESSION}:${window}" C-c
     sleep 1
-    send_keys "$window" "$PRIMER_CLI"
+    send_keys "$window" "$cli"
     sleep 2
   fi
 
@@ -172,8 +238,9 @@ rewarm_window() {
   local waited=0
   while [[ $waited -lt $PRIMER_WARMUP_TIMEOUT ]]; do
     if is_warm "$window"; then
-      log "Slot $slot re-warmed ✓"
+      log "Slot $slot re-warmed ✓ ($(slot_model_label "$slot"))"
       set_state "$slot" "warm"
+      set_model "$slot" "$(slot_model_label "$slot")"
       return 0
     fi
     sleep 2
@@ -199,16 +266,26 @@ get_state() {
   [[ -f "$file" ]] && cat "$file" || echo "unknown"
 }
 
+set_model() {
+  local slot="$1"
+  local model="$2"
+  echo "$model" > "$PRIMER_STATE_DIR/slot-${slot}-model"
+}
+
+get_model() {
+  local slot="$1"
+  local file="$PRIMER_STATE_DIR/slot-${slot}-model"
+  [[ -f "$file" ]] && cat "$file" || slot_model_label "$slot"
+}
+
 # ── lazy warm trigger ─────────────────────────────────────────────────────────
 #
 # Any process can request a warm session by touching ~/.llm-primer/warm-request.
 # Intended callers:
 #   - Claude Code PostCompact hook (context just got heavy → warm a replacement)
-#   - CLAUDE.md instruction (Claude decides its context is long → signals itself)
-#   - `primer warm` CLI command
+#   - CLAUDE.md instruction (Claude decides context is long → signals itself)
+#   - `primer warm` / `primer switch` CLI commands
 #   - Any script
-#
-# primerd consumes the file (rm after read) and warms one slot.
 
 watch_warm_request() {
   while true; do
@@ -264,6 +341,30 @@ watch_and_rewarm() {
   done
 }
 
+# ── garbage collector cron ────────────────────────────────────────────────────
+#
+# When PRIMER_GC_VAULT is set, primerd runs primer-gc periodically to move
+# stray files into _inbox/ and flag formatting issues before they cause drift.
+
+run_gc_loop() {
+  [[ -z "$PRIMER_GC_VAULT" ]] && return
+
+  # Locate primer-gc
+  local gc_bin
+  gc_bin=$(dirname "$(command -v primerd 2>/dev/null || echo "$0")")/primer-gc
+  if [[ ! -x "$gc_bin" ]]; then
+    log "GC: primer-gc not found at $gc_bin — skipping GC loop"
+    return
+  fi
+
+  log "GC: loop started (vault: $PRIMER_GC_VAULT, interval: ${PRIMER_GC_INTERVAL}s)"
+  while true; do
+    sleep "$PRIMER_GC_INTERVAL"
+    log "GC: running primer-gc on $PRIMER_GC_VAULT"
+    "$gc_bin" --vault "$PRIMER_GC_VAULT" --auto >> "$PRIMER_LOG_FILE" 2>&1 || true
+  done
+}
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 start_daemon() {
@@ -271,12 +372,12 @@ start_daemon() {
   require "$PRIMER_CLI"
 
   mkdir -p "$PRIMER_DIR" "$PRIMER_STATE_DIR"
-  log "Starting primerd (mode: $PRIMER_MODE, pool size: $PRIMER_POOL_SIZE)"
+  local haiku_slot="${PRIMER_HAIKU_SLOT:-$(_default_haiku_slot)}"
+  log "Starting primerd (mode: $PRIMER_MODE, pool: $PRIMER_POOL_SIZE slots, haiku slot: $haiku_slot)"
 
   ensure_tmux_session
 
   if [[ "$PRIMER_MODE" == "eager" ]]; then
-    # Eager: pre-warm the full pool immediately
     log "Eager mode: pre-warming $PRIMER_POOL_SIZE slots"
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
       spawn_window "$slot"
@@ -284,7 +385,6 @@ start_daemon() {
     done
     wait
   else
-    # Lazy: pool starts cold, warms on demand
     log "Lazy mode: pool is cold — warming on demand via $PRIMER_WARM_REQUEST"
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
       set_state "$slot" "cold"
@@ -296,6 +396,9 @@ start_daemon() {
 
   # Config file watcher
   watch_and_rewarm &
+
+  # Garbage collector cron (only when PRIMER_GC_VAULT is set)
+  run_gc_loop &
 
   # Health loop (eager mode: re-warm stale slots; lazy mode: no-op unless slots were warmed)
   while true; do
@@ -343,12 +446,16 @@ case "$cmd" in
       echo "primerd: not running"
     fi
     mkdir -p "$PRIMER_STATE_DIR"
+    local haiku_slot="${PRIMER_HAIKU_SLOT:-$(_default_haiku_slot)}"
     echo ""
     for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
       state=$(get_state "$slot")
+      model=$(get_model "$slot")
       warm_indicator=""
+      haiku_indicator=""
       [[ "$state" == "warm" ]] && warm_indicator=" ✓"
-      printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_indicator"
+      [[ "$slot" -eq "$haiku_slot" ]] && haiku_indicator=" [haiku]"
+      printf "  slot %s [%s]%s: %s%s\n" "$slot" "$model" "$haiku_indicator" "$state" "$warm_indicator"
     done
     ;;
   help|--help|-h)
@@ -369,11 +476,20 @@ Modes:
 
   eager            Always keeps PRIMER_POOL_SIZE sessions warm. Set PRIMER_MODE=eager.
 
+Pool layout (default: 3 slots):
+  slot 0  primary session (claude)
+  slot 1  standby session (claude)
+  slot 2  haiku slot (claude --model claude-haiku-4-5-20251001)
+
 Configuration (environment variables):
   PRIMER_DIR              State directory (default: ~/.llm-primer)
   PRIMER_SESSION_PREFIX   Tmux window prefix (default: primer)
-  PRIMER_POOL_SIZE        Max sessions in pool (default: 2)
+  PRIMER_POOL_SIZE        Max sessions in pool (default: 3)
   PRIMER_MODE             lazy | eager (default: lazy)
+  PRIMER_CLI              Default CLI for all slots (default: claude)
+  PRIMER_SLOT_{N}_CLI     Per-slot CLI override (e.g. PRIMER_SLOT_0_CLI="claude --model opus")
+  PRIMER_HAIKU_SLOT       Which slot runs Haiku (default: last slot). Set to -1 to disable.
+  PRIMER_HAIKU_CLI        Haiku slot CLI (default: claude --model claude-haiku-4-5-20251001)
   PRIMER_RESET_CMD        Command to reset session context (default: /clear for Claude Code)
                           Set to "" to kill the process and respawn PRIMER_CLI instead
   PRIMER_WARMUP_MSG       Message sent to trigger session protocol (default: ready)
@@ -381,6 +497,8 @@ Configuration (environment variables):
   PRIMER_WARMUP_TIMEOUT   Seconds to wait for warmup marker (default: 60)
   PRIMER_WATCH_DIR        Config dir to watch for changes (triggers rewarm)
   PRIMER_WATCH_INTERVAL   Seconds between watch checks (default: 5)
+  PRIMER_GC_VAULT         Vault path for garbage collector (leave empty to disable)
+  PRIMER_GC_INTERVAL      Seconds between GC runs (default: 3600)
 
 Lazy mode setup (recommended):
   Add to Claude Code settings.json:
@@ -391,7 +509,9 @@ Lazy mode setup (recommended):
     }
 
   Or add to CLAUDE.md:
-    When your context is getting long, run: touch ~/.llm-primer/warm-request
+    When your context is getting long (above ~70%), ask the user if they'd like
+    to switch to a fresh session. If yes, run: touch ~/.llm-primer/warm-request
+    Then tell them to run `primer attach` in a new terminal.
 
 HELP
     ;;
