@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-v0.1.0}"
+VERSION="${VERSION:-v0.1.1}"
 BASE="https://raw.githubusercontent.com/asakin/llm-primer/${VERSION}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 

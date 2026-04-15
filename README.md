@@ -37,6 +37,8 @@ That's the whole surface.
 
 `primer` attaches you to the first warm slot. A file watcher on an optional config dir rewarms slots when your `CLAUDE.md` changes.
 
+Warmth is signaled by the CLI printing the marker, so detection is only as reliable as the CLI following the warmup prompt. If a slot stalls, `primer logs` will show the timeout.
+
 ## Configuration
 
 Environment variables, or `~/.llm-primer/config` with `KEY=value` lines:
