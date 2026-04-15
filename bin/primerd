@@ -31,7 +31,7 @@ PRIMER_CLI="${PRIMER_CLI:-claude}"
 
 PRIMER_RESET_CMD="${PRIMER_RESET_CMD:-/clear}"
 
-_default_warmup_msg='You are running inside llm-primer, a pre-warmed session pool. When my context gets heavy, tell me once I can run `primer switch` in my shell to jump to a fresh warm session, then do not remind me again. `primer` commands run in my shell; never try to run them yourself. Now run your session start protocol.'
+_default_warmup_msg='llm-primer is pre-warming you. Do your normal session init, then print exactly "SESSION START" on its own line — but only once you are fully ready for a real message, not before. Later, if context gets heavy, remind the user once that they can run `primer switch` to jump to a fresh session, then drop it.'
 PRIMER_WARMUP_MSG="${PRIMER_WARMUP_MSG:-$_default_warmup_msg}"
 
 PRIMER_WARMUP_MARKER="${PRIMER_WARMUP_MARKER:-SESSION START}"
@@ -260,9 +260,11 @@ case "$cmd" in
       exit 0
     fi
     mkdir -p "$PRIMER_DIR"
-    start_daemon &
-    echo $! > "$PRIMER_PID_FILE"
-    echo "primerd started (pid $(cat "$PRIMER_PID_FILE"))"
+    (trap '' HUP; start_daemon) </dev/null >/dev/null 2>&1 &
+    daemon_pid=$!
+    disown "$daemon_pid" 2>/dev/null || true
+    echo "$daemon_pid" > "$PRIMER_PID_FILE"
+    echo "primerd started (pid $daemon_pid)"
     ;;
   stop)
     if [[ -f "$PRIMER_PID_FILE" ]]; then

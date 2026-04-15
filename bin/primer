@@ -73,6 +73,9 @@ cmd="${1:-attach}"
 case "$cmd" in
   attach|a|"")
     require tmux
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      die "No pool running. Start it with: primer start"
+    fi
     attach_slot="${2:-}"
     if [[ -z "$attach_slot" ]]; then
       if ! attach_slot=$(find_warm_slot); then

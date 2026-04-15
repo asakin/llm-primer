@@ -33,7 +33,7 @@ That's the whole surface.
 
 ## How it works
 
-`primerd` keeps a tmux session with N windows. Each window runs your CLI (default `claude`) and receives a warmup message that triggers session init. When the pane output contains a recognizable marker (default `SESSION START`), the slot is marked warm.
+`primerd` keeps a tmux session with N windows. Each window runs your CLI (default `claude`) and receives a warmup message that asks it to run its startup routine and print a marker when ready. When the pane output contains that marker (default `SESSION START`), the slot is marked warm.
 
 `primer` attaches you to the first warm slot. A file watcher on an optional config dir rewarms slots when your `CLAUDE.md` changes.
 
@@ -47,6 +47,8 @@ PRIMER_POOL_SIZE=2
 PRIMER_WARMUP_MARKER=SESSION START
 PRIMER_WATCH_DIR=/path/to/your/vault/_config
 ```
+
+The default warmup message already asks Claude to print `SESSION START` when its startup routine finishes, so this works on a stock Claude Code install. Override `PRIMER_WARMUP_MSG` or `PRIMER_WARMUP_MARKER` if your CLI prints something different or you want your own protocol.
 
 ## What's coming
 
