@@ -20,6 +20,7 @@
 
 exec /usr/bin/perl -e '
   $| = 1;
+  my $last = "";
   while (<STDIN>) {
     # CSI: ESC [ ... final-byte
     s/\e\[[0-9;?]*[\x20-\x2F]*[\x40-\x7E]//g;
@@ -34,6 +35,13 @@ exec /usr/bin/perl -e '
     s/.*\r(?!\n)//g;
     # Control-byte noise: BEL, BS, VT, FF
     tr/\x07\x08\x0B\x0C//d;
+    # Drop empty / whitespace-only lines — Claude Code-style full-screen
+    # redraws leave the raw stream dominated by these after ANSI stripping.
+    next if /^\s*$/;
+    # Drop consecutive duplicates — TUIs that rewrite the pane without a \r
+    # between frames produce many identical lines in a row.
+    next if $_ eq $last;
+    $last = $_;
     print;
   }
 '

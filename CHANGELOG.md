@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.2 — 2026-04-19
+
+### Fixed
+
+- `primer-log-filter` was producing thousands of empty/whitespace-only lines
+  when capturing Claude Code's pane. Claude's Ink/React renderer redraws the
+  whole screen with cursor-positioning sequences (not carriage returns), so
+  after ANSI stripping the stream was dominated by blank lines and exact
+  duplicates. The filter now drops blank lines and collapses consecutive
+  identical lines. Logs are meaningfully readable instead of mostly-empty.
+
 ## v0.2.1 — 2026-04-19
 
 ### Fixed
