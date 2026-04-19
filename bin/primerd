@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # primerd — llm-primer daemon.
-# Manages a pool of pre-warmed Claude Code sessions in tmux.
+# Manages a pool of Claude Code sessions in tmux. Two modes:
+#   - warm mode (default, v0.1 behavior): single tmux session, N numbered
+#     windows, each warmed by sending a prompt and waiting for a marker.
+#   - hold mode (v0.2, PRIMER_HOLD=1): one tmux session per named slot, each
+#     running a configurable command under an auto-respawn loop. No warmup
+#     message, no marker detection — just holds live Claude sessions alive.
 
 set -euo pipefail
 
@@ -43,15 +48,156 @@ PRIMER_SLOT_COLORS="${PRIMER_SLOT_COLORS:-#0d1b2a,#1b263b}"
 PRIMER_WATCH_DIR="${PRIMER_WATCH_DIR:-}"
 PRIMER_WATCH_INTERVAL="${PRIMER_WATCH_INTERVAL:-5}"
 
+# v0.2 additions — opt-in, backwards compatible.
+PRIMER_HOLD="${PRIMER_HOLD:-0}"
+PRIMER_SLOTS="${PRIMER_SLOTS:-}"
+PRIMER_LOG_FILTER="${PRIMER_LOG_FILTER:-}"
+PRIMER_HOLD_CHECK_INTERVAL="${PRIMER_HOLD_CHECK_INTERVAL:-30}"
+
 PRIMER_PID_FILE="$PRIMER_DIR/primerd.pid"
 PRIMER_LOG_FILE="$PRIMER_DIR/primerd.log"
 PRIMER_STATE_DIR="$PRIMER_DIR/state"
 PRIMER_WARM_REQUEST="$PRIMER_DIR/warm-request"
+PRIMER_LOG_DIR="$PRIMER_DIR/logs"
 TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$PRIMER_LOG_FILE"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 require() { command -v "$1" &>/dev/null || die "'$1' is required but not installed"; }
+
+# ── Named-slot helpers (hold mode + PRIMER_SLOTS) ──────────────────────────
+
+declare -a SLOT_COMMANDS=()
+declare -a SLOT_NAMES=()
+
+_derive_slot_name() {
+  # Extract agent name from a command like `claude --agent §sakinos` or
+  # `claude --agent=§scribe`. Falls back to "Claude" for bare `claude`.
+  local cmd="$1"
+  if [[ "$cmd" =~ --agent[[:space:]]+([^[:space:]]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$cmd" =~ --agent=([^[:space:]]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "Claude"
+  fi
+}
+
+_parse_slots() {
+  [[ -z "$PRIMER_SLOTS" ]] && return 0
+  local IFS='|'
+  read -r -a SLOT_COMMANDS <<< "$PRIMER_SLOTS"
+  local seen=""
+  for cmd in "${SLOT_COMMANDS[@]}"; do
+    local name base
+    base=$(_derive_slot_name "$cmd")
+    name="$base"
+    local n=2
+    # Disambiguate collisions: Claude, Claude-2, Claude-3...
+    while [[ ",$seen," == *",$name,"* ]]; do
+      name="${base}-${n}"
+      n=$((n + 1))
+    done
+    SLOT_NAMES+=("$name")
+    seen="${seen},${name}"
+  done
+}
+
+slot_session_name() {
+  echo "${PRIMER_SESSION_PREFIX}-${1}"
+}
+
+set_state() { mkdir -p "$PRIMER_STATE_DIR"; echo "$2" > "$PRIMER_STATE_DIR/slot-${1}"; }
+get_state() { local f="$PRIMER_STATE_DIR/slot-${1}"; [[ -f "$f" ]] && cat "$f" || echo "unknown"; }
+
+# ── Log filter helpers ─────────────────────────────────────────────────────
+
+_attach_log_filter() {
+  local session="$1"
+  local slot_label="$2"
+  [[ -z "$PRIMER_LOG_FILTER" ]] && return 0
+  mkdir -p "$PRIMER_LOG_DIR"
+  local log_path="$PRIMER_LOG_DIR/${slot_label}.log"
+  # Overwrite on (re)attach so the filter command is consistent.
+  tmux pipe-pane -t "$session" -o "$PRIMER_LOG_FILTER >> '$log_path'" 2>/dev/null || \
+    log "WARNING: failed to attach log filter to $session"
+}
+
+_announce_debug_mode() {
+  # Sends a one-time prompt into the session telling Claude to announce the
+  # logging state to the user. Runs in a background subshell so the daemon
+  # main loop doesn't block on CLI startup time.
+  local session="$1"
+  local slot_label="$2"
+  local log_path="$PRIMER_LOG_DIR/${slot_label}.log"
+  local msg="DEBUG MODE is on for this session. Everything you output is being piped through a filter and appended to ${log_path} for the user's records. In your first reply, tell the user: 'DEBUG MODE — this session is being logged to ${log_path}.' Then proceed normally."
+  (
+    sleep "$PRIMER_CLI_READY_WAIT"
+    tmux send-keys -t "$session" -l "$msg" 2>/dev/null || exit 0
+    sleep 0.3
+    tmux send-keys -t "$session" Enter 2>/dev/null || true
+  ) &
+  disown "$!" 2>/dev/null || true
+}
+
+# ── Hold mode ──────────────────────────────────────────────────────────────
+
+ensure_hold_session() {
+  # Create tmux session for a named slot if missing. Wraps the command in a
+  # respawn loop so Claude exit → relaunch without daemon babysitting.
+  local slot_name="$1"
+  local cmd="$2"
+  local session
+  session=$(slot_session_name "$slot_name")
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    return 1
+  fi
+
+  # The respawn loop runs inside tmux's shell-command. `sleep 2` prevents a
+  # runaway loop if the CLI crashes immediately; user can still ctrl-c the
+  # inner process and get a fresh one.
+  tmux new-session -d -s "$session" "while :; do ${cmd}; sleep 2; done"
+  tmux set-option -t "$session" status off 2>/dev/null || true
+  log "Hold session up: $session ($cmd)"
+
+  _attach_log_filter "$session" "$slot_name"
+  [[ -n "$PRIMER_LOG_FILTER" ]] && _announce_debug_mode "$session" "$slot_name"
+
+  set_state "$slot_name" "held"
+  return 0
+}
+
+start_hold_daemon() {
+  require tmux
+  mkdir -p "$PRIMER_DIR" "$PRIMER_STATE_DIR"
+
+  if [[ ${#SLOT_COMMANDS[@]} -eq 0 ]]; then
+    # Hold mode without PRIMER_SLOTS: spawn N copies of PRIMER_CLI.
+    local n=0
+    while [[ $n -lt $PRIMER_POOL_SIZE ]]; do
+      SLOT_COMMANDS+=("$PRIMER_CLI")
+      local name="Claude"
+      [[ $n -gt 0 ]] && name="Claude-$((n + 1))"
+      SLOT_NAMES+=("$name")
+      n=$((n + 1))
+    done
+  fi
+
+  log "Starting primerd in HOLD mode (${#SLOT_COMMANDS[@]} slots, filter: ${PRIMER_LOG_FILTER:-none})"
+  for i in "${!SLOT_COMMANDS[@]}"; do
+    log "  slot '${SLOT_NAMES[$i]}' → ${SLOT_COMMANDS[$i]}"
+  done
+
+  while true; do
+    for i in "${!SLOT_COMMANDS[@]}"; do
+      ensure_hold_session "${SLOT_NAMES[$i]}" "${SLOT_COMMANDS[$i]}" || true
+    done
+    sleep "$PRIMER_HOLD_CHECK_INTERVAL"
+  done
+}
+
+# ── Warm mode (v0.1 behavior, preserved) ───────────────────────────────────
 
 window_name() { echo "${PRIMER_SESSION_PREFIX}-$1"; }
 
@@ -110,6 +256,12 @@ spawn_window() {
   if [[ -n "$color" ]]; then
     tmux set-window-option -t "${TMUX_SESSION}:${window}" window-style "bg=${color}" 2>/dev/null || true
   fi
+
+  if [[ -n "$PRIMER_LOG_FILTER" ]]; then
+    _attach_log_filter "${TMUX_SESSION}:${window}" "slot-${slot}"
+    _announce_debug_mode "${TMUX_SESSION}:${window}" "slot-${slot}"
+  fi
+
   set_state "$slot" "spawned"
 }
 
@@ -183,9 +335,6 @@ rewarm_window() {
   set_state "$slot" "stale"
 }
 
-set_state() { mkdir -p "$PRIMER_STATE_DIR"; echo "$2" > "$PRIMER_STATE_DIR/slot-${1}"; }
-get_state() { local f="$PRIMER_STATE_DIR/slot-${1}"; [[ -f "$f" ]] && cat "$f" || echo "unknown"; }
-
 watch_warm_request() {
   while true; do
     if [[ -f "$PRIMER_WARM_REQUEST" ]]; then
@@ -231,7 +380,7 @@ watch_and_rewarm() {
   done
 }
 
-start_daemon() {
+start_warm_daemon() {
   require tmux
   require "${PRIMER_CLI%% *}"
 
@@ -251,6 +400,47 @@ start_daemon() {
   wait
 }
 
+# ── Status reporting ───────────────────────────────────────────────────────
+
+status_hold() {
+  echo ""
+  echo "mode: hold"
+  for i in "${!SLOT_NAMES[@]}"; do
+    local name="${SLOT_NAMES[$i]}"
+    local session
+    session=$(slot_session_name "$name")
+    local tag=""
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tag="✓"
+    fi
+    printf "  %s: %s %s\n" "$name" "$(get_state "$name")" "$tag"
+  done
+}
+
+status_warm() {
+  mkdir -p "$PRIMER_STATE_DIR"
+  echo ""
+  echo "mode: warm"
+  for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+    state=$(get_state "$slot")
+    warm_tag=""
+    [[ "$state" == "warm" ]] && warm_tag=" ✓"
+    printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_tag"
+  done
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+
+_parse_slots
+
+start_daemon() {
+  if [[ "$PRIMER_HOLD" == "1" ]]; then
+    start_hold_daemon
+  else
+    start_warm_daemon
+  fi
+}
+
 cmd="${1:-help}"
 
 case "$cmd" in
@@ -264,7 +454,9 @@ case "$cmd" in
     daemon_pid=$!
     disown "$daemon_pid" 2>/dev/null || true
     echo "$daemon_pid" > "$PRIMER_PID_FILE"
-    echo "primerd started (pid $daemon_pid)"
+    mode="warm"
+    [[ "$PRIMER_HOLD" == "1" ]] && mode="hold"
+    echo "primerd started (pid $daemon_pid, mode: $mode)"
     ;;
   stop)
     if [[ -f "$PRIMER_PID_FILE" ]]; then
@@ -280,14 +472,11 @@ case "$cmd" in
     else
       echo "primerd: not running"
     fi
-    mkdir -p "$PRIMER_STATE_DIR"
-    echo ""
-    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-      state=$(get_state "$slot")
-      warm_tag=""
-      [[ "$state" == "warm" ]] && warm_tag=" ✓"
-      printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_tag"
-    done
+    if [[ "$PRIMER_HOLD" == "1" ]]; then
+      status_hold
+    else
+      status_warm
+    fi
     ;;
   help|--help|-h)
     cat <<'HELP'
@@ -295,14 +484,26 @@ primerd — llm-primer daemon
 
 Usage: primerd <start|stop|status>
 
-Configuration (env or ~/.llm-primer/config):
+Core configuration (env or ~/.llm-primer/config):
   PRIMER_CLI             CLI command (default: claude)
-  PRIMER_POOL_SIZE       Pool size (default: 2)
-  PRIMER_WATCH_DIR       Dir to rewarm on changes (optional)
-  PRIMER_WARMUP_MARKER   Warmth signal string (default: SESSION START)
+  PRIMER_POOL_SIZE       Pool size (default: 2, warm mode only)
+  PRIMER_WATCH_DIR       Dir to rewarm on changes (warm mode only)
+  PRIMER_WARMUP_MARKER   Warmth signal (default: SESSION START)
   PRIMER_WARMUP_TIMEOUT  Seconds to wait (default: 180)
   PRIMER_RESET_CMD       Soft-reset command (default: /clear)
   PRIMER_SLOT_COLORS     Comma-sep pane bg colors
+
+Hold mode (v0.2):
+  PRIMER_HOLD=1          Skip warmup; hold N live Claude sessions
+  PRIMER_SLOTS           Pipe-separated command list, one per slot
+                         e.g. "claude|claude --agent §sakinos|claude --agent §scribe"
+                         Slot names are derived from the --agent flag.
+
+Log filter (v0.2):
+  PRIMER_LOG_FILTER      Command to pipe pane output through. Off by default.
+                         When set, Claude is told to announce DEBUG MODE on first
+                         response so the user always knows logging is active.
+                         Log files land in ~/.llm-primer/logs/<slot>.log.
 
 See README.md for full details.
 HELP

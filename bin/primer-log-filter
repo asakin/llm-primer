@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# primer-log-filter — strip ANSI + spinner noise from a pane output stream.
+#
+# Reads stdin, writes cleaned stdout. Unbuffered so it's safe to pipe into a
+# live-tailed log file:
+#
+#   tmux pipe-pane -t <target> -o "primer-log-filter >> session.log"
+#
+# Removes:
+#   - ANSI CSI escapes (color, cursor movement)
+#   - OSC escapes (window/tab title setters)
+#   - DCS / SOS / PM / APC escapes
+#   - Carriage-return-overwritten frames (keeps only the final frame of each
+#     spinner/progress-bar cycle)
+#   - BEL, BS, VT, FF control bytes
+#
+# Opt-in only. When wired via PRIMER_LOG_FILTER, primerd sends a prompt into
+# the session on startup telling Claude to announce DEBUG MODE to the user —
+# the logging is never silent.
+
+exec /usr/bin/perl -e '
+  $| = 1;
+  while (<STDIN>) {
+    # CSI: ESC [ ... final-byte
+    s/\e\[[0-9;?]*[\x20-\x2F]*[\x40-\x7E]//g;
+    # OSC: ESC ] ... BEL (or ESC \)
+    s/\e\].*?(?:\x07|\e\\)//g;
+    # DCS/SOS/PM/APC: ESC [PX^_] ... ESC \
+    s/\e[PX^_\]].*?\e\\//g;
+    # Lone ESC + next-byte that escaped the above
+    s/\e[@-Z\\-_]//g;
+    # Collapse carriage-return-delimited frames: greedy `.*\r` keeps only the
+    # final frame in each rewrite chain.
+    s/.*\r(?!\n)//g;
+    # Control-byte noise: BEL, BS, VT, FF
+    tr/\x07\x08\x0B\x0C//d;
+    print;
+  }
+'

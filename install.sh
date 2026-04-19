@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-v0.1.1}"
+VERSION="${VERSION:-v0.2.0}"
 BASE="https://raw.githubusercontent.com/asakin/llm-primer/${VERSION}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
@@ -17,7 +17,7 @@ echo "→ Installing llm-primer ${VERSION} to ${INSTALL_DIR}"
 
 [[ -w "$INSTALL_DIR" ]] || die "Cannot write to $INSTALL_DIR. Re-run with sudo or set INSTALL_DIR to a writable path."
 
-for bin in primer primerd; do
+for bin in primer primerd primer-log-filter; do
   echo "  downloading $bin"
   curl -fsSL "$BASE/bin/$bin" -o "$INSTALL_DIR/$bin"
   chmod +x "$INSTALL_DIR/$bin"
