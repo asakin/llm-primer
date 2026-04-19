@@ -28,12 +28,15 @@ _load_config
 PRIMER_DIR="${PRIMER_DIR:-$HOME/.llm-primer}"
 PRIMER_SESSION_PREFIX="${PRIMER_SESSION_PREFIX:-primer}"
 PRIMER_POOL_SIZE="${PRIMER_POOL_SIZE:-2}"
+PRIMER_HOLD="${PRIMER_HOLD:-0}"
+PRIMER_SLOTS="${PRIMER_SLOTS:-}"
 TMUX_SESSION="$PRIMER_SESSION_PREFIX-pool"
 
 die() { echo "error: $*" >&2; exit 1; }
 require() { command -v "$1" &>/dev/null || die "'$1' is required but not installed"; }
 
 window_name() { echo "${PRIMER_SESSION_PREFIX}-$1"; }
+slot_session_name() { echo "${PRIMER_SESSION_PREFIX}-${1}"; }
 get_state()   { local f="$PRIMER_DIR/state/slot-${1}"; [[ -f "$f" ]] && cat "$f" || echo "unknown"; }
 
 pane_content() {
@@ -51,7 +54,54 @@ find_warm_slot() {
   return 1
 }
 
-do_attach() {
+# ── Named-slot helpers (PRIMER_SLOTS) ──────────────────────────────────────
+
+declare -a SLOT_COMMANDS=()
+declare -a SLOT_NAMES=()
+
+_derive_slot_name() {
+  local cmd="$1"
+  if [[ "$cmd" =~ --agent[[:space:]]+([^[:space:]]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$cmd" =~ --agent=([^[:space:]]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "Claude"
+  fi
+}
+
+_parse_slots() {
+  [[ -z "$PRIMER_SLOTS" ]] && return 0
+  local IFS='|'
+  read -r -a SLOT_COMMANDS <<< "$PRIMER_SLOTS"
+  local seen=""
+  for cmd in "${SLOT_COMMANDS[@]}"; do
+    local name base
+    base=$(_derive_slot_name "$cmd")
+    name="$base"
+    local n=2
+    while [[ ",$seen," == *",$name,"* ]]; do
+      name="${base}-${n}"
+      n=$((n + 1))
+    done
+    SLOT_NAMES+=("$name")
+    seen="${seen},${name}"
+  done
+}
+
+_slot_index() {
+  local target="$1"
+  for i in "${!SLOT_NAMES[@]}"; do
+    [[ "${SLOT_NAMES[$i]}" == "$target" ]] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+_parse_slots
+
+# ── Attach ─────────────────────────────────────────────────────────────────
+
+do_attach_legacy() {
   local slot="$1"
   local window
   window=$(window_name "$slot")
@@ -68,36 +118,132 @@ do_attach() {
   fi
 }
 
+do_attach_named() {
+  local slot_name="$1"
+  local session
+  session=$(slot_session_name "$slot_name")
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    die "Slot '$slot_name' not found. Is primerd running? ('primer status' to check)"
+  fi
+  echo "→ Attaching to slot: $slot_name"
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$session"
+  else
+    if ! tmux attach-session -t "$session"; then
+      echo ""
+      die "Could not attach. Are you in a non-TTY shell? Try from iTerm directly."
+    fi
+  fi
+}
+
+do_attach_auto() {
+  local arg="${1:-}"
+
+  # Named-slot mode.
+  if [[ ${#SLOT_NAMES[@]} -gt 0 ]]; then
+    if [[ -z "$arg" ]]; then
+      arg="${SLOT_NAMES[0]}"
+    fi
+    if _slot_index "$arg" >/dev/null; then
+      do_attach_named "$arg"
+      return
+    fi
+    # If the arg happens to match an existing `primer-<arg>` session, attach anyway.
+    if tmux has-session -t "$(slot_session_name "$arg")" 2>/dev/null; then
+      do_attach_named "$arg"
+      return
+    fi
+    die "Unknown slot: '$arg'. Known slots: ${SLOT_NAMES[*]}"
+  fi
+
+  # Legacy (warm) mode.
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    die "No pool running. Start it with: primer start"
+  fi
+
+  local attach_slot="$arg"
+  if [[ -z "$attach_slot" ]]; then
+    if ! attach_slot=$(find_warm_slot); then
+      attach_slot=0
+      echo "⚠ No warm slots available. Requesting warm on slot $attach_slot..."
+      touch "$PRIMER_DIR/warm-request"
+      waited=0
+      while [[ $waited -lt 10 ]]; do
+        state=$(get_state "$attach_slot")
+        [[ "$state" == "warm" || "$state" == "warming" ]] && break
+        sleep 1
+        waited=$((waited + 1))
+      done
+      echo "→ Attaching anyway. You'll see the startup protocol run live if it's still warming."
+    fi
+  fi
+  do_attach_legacy "$attach_slot"
+}
+
+# ── Switch ─────────────────────────────────────────────────────────────────
+
+do_switch_named() {
+  local slot_name="$1"
+  local session
+  session=$(slot_session_name "$slot_name")
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    die "Slot '$slot_name' not found."
+  fi
+  echo "→ Killing and respawning slot: $slot_name"
+  tmux kill-session -t "$session"
+  echo "   primerd's check loop will respawn it within a few seconds."
+  echo "   Run 'primer attach $slot_name' once it's back, or just 'primer status' to watch."
+}
+
+# ── Status ─────────────────────────────────────────────────────────────────
+
+status_named() {
+  echo ""
+  echo "mode: hold (named slots)"
+  for name in "${SLOT_NAMES[@]}"; do
+    local session
+    session=$(slot_session_name "$name")
+    local tag="(down)"
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tag="✓"
+    fi
+    printf "  %s: %s\n" "$name" "$tag"
+  done
+}
+
+status_legacy() {
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "pool: no tmux session found"
+  else
+    echo "pool: $TMUX_SESSION"
+    for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
+      state=$(get_state "$slot")
+      warm_tag=""
+      is_warm "$slot" 2>/dev/null && warm_tag=" ✓"
+      printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_tag"
+    done
+  fi
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+
 cmd="${1:-attach}"
 
 case "$cmd" in
   attach|a|"")
     require tmux
-    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-      die "No pool running. Start it with: primer start"
-    fi
-    attach_slot="${2:-}"
-    if [[ -z "$attach_slot" ]]; then
-      if ! attach_slot=$(find_warm_slot); then
-        attach_slot=0
-        echo "⚠ No warm slots available. Requesting warm on slot $attach_slot..."
-        touch "$PRIMER_DIR/warm-request"
-        waited=0
-        while [[ $waited -lt 10 ]]; do
-          state=$(get_state "$attach_slot")
-          [[ "$state" == "warm" || "$state" == "warming" ]] && break
-          sleep 1
-          waited=$((waited + 1))
-        done
-        echo "→ Attaching anyway. You'll see the startup protocol run live if it's still warming."
-      fi
-    fi
-    do_attach "$attach_slot"
+    do_attach_auto "${2:-}"
     ;;
 
   switch|sw)
-    touch "$PRIMER_DIR/warm-request"
-    cat <<'MSG'
+    require tmux
+    target="${2:-}"
+    if [[ ${#SLOT_NAMES[@]} -gt 0 ]]; then
+      [[ -z "$target" ]] && die "usage: primer switch <slot-name>"
+      do_switch_named "$target"
+    else
+      touch "$PRIMER_DIR/warm-request"
+      cat <<'MSG'
 → Switch requested. primerd is warming a fresh session.
 
 When you're ready to switch:
@@ -106,6 +252,7 @@ When you're ready to switch:
 
 Your current session stays open. Copy anything you need before closing it.
 MSG
+    fi
     ;;
 
   warm|w)
@@ -121,16 +268,10 @@ MSG
       echo "daemon: not running (start with 'primer start')"
     fi
     echo ""
-    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-      echo "pool: no tmux session found"
+    if [[ ${#SLOT_NAMES[@]} -gt 0 ]]; then
+      status_named
     else
-      echo "pool: $TMUX_SESSION"
-      for slot in $(seq 0 $((PRIMER_POOL_SIZE - 1))); do
-        state=$(get_state "$slot")
-        warm_tag=""
-        is_warm "$slot" 2>/dev/null && warm_tag=" ✓"
-        printf "  slot %s: %s%s\n" "$slot" "$state" "$warm_tag"
-      done
+      status_legacy
     fi
     ;;
 
@@ -138,33 +279,42 @@ MSG
   stop)  primerd stop ;;
 
   logs|log)
-    log_file="$PRIMER_DIR/primerd.log"
-    [[ -f "$log_file" ]] && tail -f "$log_file" || echo "No log file found at $log_file"
+    target="${2:-}"
+    if [[ -n "$target" && -f "$PRIMER_DIR/logs/${target}.log" ]]; then
+      tail -f "$PRIMER_DIR/logs/${target}.log"
+    else
+      log_file="$PRIMER_DIR/primerd.log"
+      [[ -f "$log_file" ]] && tail -f "$log_file" || echo "No log file found at $log_file"
+    fi
     ;;
 
   help|--help|-h)
     cat <<'HELP'
 primer — llm-primer
 
-Attach to a pre-warmed Claude Code session instantly.
+Attach to and manage Claude Code sessions.
 
 Usage:
-  primer [attach]       Attach to a warm session
-  primer switch         Pre-warm a replacement and print switch instructions
-  primer warm           Signal primerd to warm a session now
-  primer status         Show pool and daemon status
-  primer start          Start the primerd daemon
-  primer stop           Stop the primerd daemon
-  primer logs           Tail the daemon log
+  primer [attach] [slot]    Attach to a session. Slot name (hold mode) or
+                            number (warm mode). Omit for first/warm slot.
+  primer switch <slot>      Hold mode: kill + respawn the named slot.
+                            Warm mode: pre-warm a replacement slot.
+  primer warm               Signal primerd to warm a session now (warm mode).
+  primer status             Show pool and daemon status.
+  primer start              Start the primerd daemon.
+  primer stop               Stop the primerd daemon.
+  primer logs [slot]        Tail the daemon log, or a slot's pane log
+                            (requires PRIMER_LOG_FILTER).
 
 Configuration:
-  ~/.llm-primer/config  KEY=value pairs. See README for details.
+  ~/.llm-primer/config      KEY=value pairs. See README for details.
 
-Environment:
-  PRIMER_CLI            CLI command (default: claude)
-  PRIMER_POOL_SIZE      Pool size (default: 2)
-  PRIMER_WATCH_DIR      Dir to rewarm on changes
-  PRIMER_WARMUP_MARKER  String signaling warmth (default: SESSION START)
+Key environment variables:
+  PRIMER_CLI                CLI command (default: claude)
+  PRIMER_POOL_SIZE          Pool size (default: 2, warm mode only)
+  PRIMER_HOLD=1             Hold mode: no warmup, per-slot tmux sessions
+  PRIMER_SLOTS              Hold mode slot command list, pipe-separated
+  PRIMER_LOG_FILTER         Pane output filter for ~/.llm-primer/logs/
 
 HELP
     ;;

@@ -29,7 +29,7 @@ primer status     # see which slots are warm
 primer stop       # stop the daemon
 ```
 
-That's the whole surface.
+That's the default surface. Two optional modes extend it: **hold mode** and **log filter** (both opt-in, off by default, additive since v0.2.0).
 
 ## How it works
 
@@ -51,6 +51,48 @@ PRIMER_WATCH_DIR=/path/to/your/vault/_config
 ```
 
 The default warmup message already asks Claude to print `SESSION START` when its startup routine finishes, so this works on a stock Claude Code install. Override `PRIMER_WARMUP_MSG` or `PRIMER_WARMUP_MARKER` if your CLI prints something different or you want your own protocol.
+
+## Hold mode (v0.2)
+
+Some setups don't need the warmup-and-detect dance. They just want N persistent Claude sessions that stay alive in the background, each pinned to a specific agent or flag set, attachable by name.
+
+Hold mode does exactly that:
+
+```ini
+PRIMER_HOLD=1
+PRIMER_SLOTS=claude|claude --agent engineer|claude --agent writer
+```
+
+Every pipe-separated entry in `PRIMER_SLOTS` becomes its own tmux session, named by the `--agent` value (or `Claude` for a bare `claude`). Each session runs under a respawn loop so if Claude exits, it comes back up within a couple of seconds.
+
+```bash
+primer              # attach to the first slot
+primer attach writer # attach to a specific named slot
+primer switch writer # kill + respawn that slot with a fresh process
+primer status       # list slots and whether their sessions are alive
+```
+
+No warmup message is sent. No marker is expected. Use this when you want llm-primer to be the session holder and you want to drive Claude yourself.
+
+## Log filter (v0.2)
+
+Optional. Off by default. When set, pipes each pane's output through a filter command into `~/.llm-primer/logs/<slot>.log`, so you have a tailable record of your sessions.
+
+```ini
+PRIMER_LOG_FILTER=primer-log-filter
+```
+
+`primer-log-filter` ships with llm-primer — it strips ANSI escapes and spinner frames so the log file is plaintext-friendly. You can substitute any command that reads stdin and writes filtered stdout.
+
+**This is a privacy-sensitive feature, so it behaves loudly when enabled:**
+
+- It is off by default. You must explicitly set `PRIMER_LOG_FILTER` to turn it on.
+- When on, primerd sends a one-time prompt into each session at startup telling Claude to announce to the user that `DEBUG MODE` is active and that output is being logged to a specific file. Claude will say so in its first response.
+- The log path is included in the announcement so you (or anyone sharing the machine) can see exactly where logs go.
+
+Don't use this to log somebody else's work without telling them. That's what the announcement prompt is there to prevent — the session tells the user it's logged before anything useful happens.
+
+Tail a specific slot's log: `primer logs <slot>`.
 
 ## What's coming
 
