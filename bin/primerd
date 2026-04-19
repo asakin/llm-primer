@@ -53,6 +53,9 @@ PRIMER_HOLD="${PRIMER_HOLD:-0}"
 PRIMER_SLOTS="${PRIMER_SLOTS:-}"
 PRIMER_LOG_FILTER="${PRIMER_LOG_FILTER:-}"
 PRIMER_HOLD_CHECK_INTERVAL="${PRIMER_HOLD_CHECK_INTERVAL:-30}"
+# Default working directory for hold-mode tmux sessions. Default is $HOME so
+# the session opens somewhere sane; set to e.g. your vault root to land there.
+PRIMER_CWD="${PRIMER_CWD:-$HOME}"
 
 PRIMER_PID_FILE="$PRIMER_DIR/primerd.pid"
 PRIMER_LOG_FILE="$PRIMER_DIR/primerd.log"
@@ -156,8 +159,10 @@ ensure_hold_session() {
 
   # The respawn loop runs inside tmux's shell-command. `sleep 2` prevents a
   # runaway loop if the CLI crashes immediately; user can still ctrl-c the
-  # inner process and get a fresh one.
-  tmux new-session -d -s "$session" "while :; do ${cmd}; sleep 2; done"
+  # inner process and get a fresh one. `-c` sets the starting cwd so the
+  # session opens at PRIMER_CWD (e.g., the user's vault root) regardless of
+  # where primerd itself was invoked.
+  tmux new-session -d -s "$session" -c "$PRIMER_CWD" "while :; do ${cmd}; sleep 2; done"
   tmux set-option -t "$session" status off 2>/dev/null || true
   log "Hold session up: $session ($cmd)"
 
@@ -458,6 +463,22 @@ case "$cmd" in
     [[ "$PRIMER_HOLD" == "1" ]] && mode="hold"
     echo "primerd started (pid $daemon_pid, mode: $mode)"
     ;;
+  run-foreground)
+    # Foreground variant for launchd. Does NOT fork. launchd treats the running
+    # primerd as the job's main process and can KeepAlive it properly. Never
+    # use this from an interactive shell — it blocks.
+    if [[ -f "$PRIMER_PID_FILE" ]] && kill -0 "$(cat "$PRIMER_PID_FILE")" 2>/dev/null; then
+      echo "primerd is already running (pid $(cat "$PRIMER_PID_FILE"))" >&2
+      exit 0
+    fi
+    mkdir -p "$PRIMER_DIR"
+    echo $$ > "$PRIMER_PID_FILE"
+    trap 'rm -f "$PRIMER_PID_FILE"' EXIT
+    mode="warm"
+    [[ "$PRIMER_HOLD" == "1" ]] && mode="hold"
+    log "primerd starting in foreground (mode: $mode, pid $$)"
+    start_daemon
+    ;;
   stop)
     if [[ -f "$PRIMER_PID_FILE" ]]; then
       kill "$(cat "$PRIMER_PID_FILE")" 2>/dev/null && echo "primerd stopped" || echo "primerd was not running"
@@ -482,7 +503,12 @@ case "$cmd" in
     cat <<'HELP'
 primerd — llm-primer daemon
 
-Usage: primerd <start|stop|status>
+Usage: primerd <start|stop|status|run-foreground>
+
+  start            Start as a daemon (forks + returns).
+  run-foreground   Run in the foreground; for launchd / process supervisors.
+  stop             Stop the running daemon.
+  status           Show daemon + pool state.
 
 Core configuration (env or ~/.llm-primer/config):
   PRIMER_CLI             CLI command (default: claude)
@@ -498,6 +524,8 @@ Hold mode (v0.2):
   PRIMER_SLOTS           Pipe-separated command list, one per slot
                          e.g. "claude|claude --agent §sakinos|claude --agent §scribe"
                          Slot names are derived from the --agent flag.
+  PRIMER_CWD             Initial tmux working directory for each session
+                         (default: $HOME).
 
 Log filter (v0.2):
   PRIMER_LOG_FILTER      Command to pipe pane output through. Off by default.

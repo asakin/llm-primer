@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.3 — 2026-04-19
+
+### Added
+
+- `PRIMER_CWD` config variable (default `$HOME`). Hold-mode tmux sessions
+  open with this as their initial working directory instead of inheriting
+  whatever directory `primer start` was run from. Set it to your vault root
+  or project root so `cd` is never needed inside the session.
+
+- `primerd run-foreground` subcommand. Runs the daemon in the foreground
+  instead of forking. This is the form launchd / systemd want — they track
+  the running process directly and `KeepAlive` can actually keep the daemon
+  alive. Not for interactive use (it blocks). `primerd start` still forks
+  and disowns as before; unchanged for everyday use.
+
 ## v0.2.2 — 2026-04-19
 
 ### Fixed
