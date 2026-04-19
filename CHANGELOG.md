@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.1 — 2026-04-19
+
+### Fixed
+
+- `primer attach <name>`, `primer status`, and `primer switch <name>` now
+  work in any shell without requiring `PRIMER_SLOTS` to be exported in the
+  environment or defined in `~/.llm-primer/config`. The CLI discovers live
+  hold-mode slots directly from tmux (`primer-<name>` sessions), so you can
+  open a fresh terminal, run `primer attach §sakinos`, and it just works as
+  long as the daemon is running.
+
 ## v0.2.0 — 2026-04-19
 
 Additive release. All new features are opt-in; default behavior is unchanged

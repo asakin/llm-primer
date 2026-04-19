@@ -97,7 +97,25 @@ _slot_index() {
   return 1
 }
 
+_discover_slots_from_tmux() {
+  # Fallback when PRIMER_SLOTS isn't in env/config: discover live slots from
+  # tmux itself. A named-mode slot is any `primer-<name>` session that isn't
+  # the legacy warm-mode pool session. This lets `primer attach <name>`,
+  # `primer status`, `primer switch <name>`, etc., work in any shell without
+  # needing the config exported.
+  [[ ${#SLOT_NAMES[@]} -gt 0 ]] && return 0
+  command -v tmux &>/dev/null || return 0
+  local line name
+  while IFS= read -r line; do
+    [[ "$line" == "$TMUX_SESSION" ]] && continue
+    name="${line#${PRIMER_SESSION_PREFIX}-}"
+    [[ -z "$name" ]] && continue
+    SLOT_NAMES+=("$name")
+  done < <(tmux ls -F '#{session_name}' 2>/dev/null | grep "^${PRIMER_SESSION_PREFIX}-")
+}
+
 _parse_slots
+_discover_slots_from_tmux
 
 # ── Attach ─────────────────────────────────────────────────────────────────
 
